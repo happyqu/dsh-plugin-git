@@ -19,19 +19,10 @@ DeepSeek Harness（DSH）的 Git 插件，把常见的 Git 操作搬进一个独
 
 支持中文/英文界面与深浅主题。可选开启 AI 辅助，让模型生成提交信息、解释某次提交。
 
-同时向 Agent 提供只读工具（`git_status`、`git_log`、`git_diff`、`git_blame`、
-`git_line_history`、`git_commit_graph` 等），写操作默认不开放，由你在面板里确认执行。
-
 ## 安装
 
 1. 先安装 [Git](https://git-scm.com/downloads)，确保 `git` 在 PATH 中可用。
-2. 安装插件：
-
-   ```bash
-   dsh plugin --profile desktop add @happyqu/dsh-plugin-git
-   ```
-
-   也可以在 DSH 侧栏打开 **插件 → 添加插件**，输入 `@happyqu/dsh-plugin-git` 安装。
+2. 在 DSH 侧栏打开 **插件 → 添加插件**，输入 `@happyqu/dsh-plugin-git` 安装。
 
 3. 启用后打开 Git 面板即可使用。
 

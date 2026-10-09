@@ -167,7 +167,7 @@ const COMMIT_DETAIL = {
 
 const CONFIG = {
   gitPath: '', defaultRepo: '', similarityThreshold: 50, autoBlame: true, blameChunkLines: 2000,
-  historyLimit: 300, aiEnabled: true, aiProvider: '', aiModel: '', locale: '', enableWriteTools: false,
+  historyLimit: 300, aiEnabled: true, aiProvider: '', aiModel: '', locale: '',
 }
 
 const DIAGNOSTICS = {
