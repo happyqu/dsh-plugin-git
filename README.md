@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）的 Git 插件，把常见的 Git 操作搬进一个独立的工作台面板。
 
-![Git 插件截图](docs/screenshot.png)
+![Git 插件截图](https://raw.githubusercontent.com/happyqu/dsh-plugin-git/main/docs/screenshot.png)
 
 ## 功能
 
