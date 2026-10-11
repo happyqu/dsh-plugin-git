@@ -1,6 +1,6 @@
 {
   "name": "@happyqu/dsh-plugin-git",
-  "version": "0.1.8",
+  "version": "0.1.7",
   "description": "Git workbench for deepseek-harness: changelists, staging, history, branches, stashes and optional AI assistance",
   "type": "module",
   "main": "lib/index.js",
@@ -44,6 +44,7 @@
   },
   "scripts": {
     "check": "node scripts/check-package.mjs",
+    "test": "node scripts/verify-client.mjs",
     "prepack": "npm run check"
   },
   "engines": {

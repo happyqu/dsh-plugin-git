@@ -168,6 +168,22 @@ export const React = {
     props: { ...(props ?? {}), children: normalizeChildren(children) },
   }),
   Fragment: Symbol('Fragment'),
+  /**
+   * `memo` is a render optimisation, not a semantic one: it only lets React skip
+   * a re-render when props are shallow-equal. This harness re-renders eagerly, so
+   * handing back the component itself is faithful for every assertion made here —
+   * while still being required, because the Client half calls `React.memo` at
+   * module scope and a missing shim throws before any test can run.
+   */
+  memo: (component) => component,
+  /**
+   * `useLayoutEffect` differs from `useEffect` only in WHEN React flushes it
+   * (before paint, synchronously). This harness has no paint, and both are
+   * drained by `flush()`, so aliasing them is faithful for these assertions
+   * while still being required: the Client half calls it during render, and a
+   * missing shim throws before any test can run.
+   */
+  useLayoutEffect: useEffect,
   useState,
   useRef,
   useEffect,
@@ -285,6 +301,34 @@ function bindRef(props, registry) {
     },
     setPointerCapture() {},
     releasePointerCapture() {},
+    /**
+     * Ancestor lookup.
+     *
+     * The harness renders to a plain tree with no parent links, so a real
+     * `closest` walk is impossible. Returning null is the honest answer for a
+     * detached fake node, and it is the branch real code must already handle —
+     * the element may legitimately have been unmounted by the time an effect
+     * runs. Tests that need an ancestor use `refNode()` instead.
+     *
+     * @returns null, always.
+     */
+    closest() {
+      return null
+    },
+    /**
+     * Descendant lookup, likewise absent on a fake node.
+     * @returns null, always.
+     */
+    querySelector() {
+      return null
+    },
+    /**
+     * Descendant lookup, likewise absent on a fake node.
+     * @returns an empty list, always.
+     */
+    querySelectorAll() {
+      return []
+    },
   }
   ref.current = node
   registry.set(props.className, node)
@@ -505,6 +549,32 @@ export function loadClientModule(source, options = {}) {
         captured.factory = entry.factory
       },
     },
+    /** Window-level listener bookkeeping (resize, online/offline, storage). */
+    listeners: new Map(),
+    /**
+     * Register a window-level listener.
+     *
+     * `window` is a distinct event target from `document` in a browser, and the
+     * Client half uses both, so the harness has to keep them separate rather
+     * than aliasing one onto the other.
+     *
+     * @param type - the event type.
+     * @param handler - the listener.
+     */
+    addEventListener(type, handler) {
+      const list = sandboxWindow.listeners.get(type) ?? []
+      list.push(handler)
+      sandboxWindow.listeners.set(type, list)
+    },
+    /**
+     * Remove a window-level listener.
+     * @param type - the event type.
+     * @param handler - the listener.
+     */
+    removeEventListener(type, handler) {
+      const list = sandboxWindow.listeners.get(type) ?? []
+      sandboxWindow.listeners.set(type, list.filter((entry) => entry !== handler))
+    },
   }
 
   // The plugin body references `window` and `document`; provide just enough for
@@ -551,16 +621,46 @@ export function loadClientModule(source, options = {}) {
         remove() {},
       }
     },
+    /**
+     * Document-level lookup.
+     *
+     * The harness tree is not attached to the fake document, so nothing is ever
+     * found. Null is the honest answer and the branch real code already handles
+     * (a panel may not be mounted yet). Tests inspect the rendered tree through
+     * `walk`/`findWhere` instead.
+     *
+     * @returns null, always.
+     */
+    querySelector() {
+      return null
+    },
+    /**
+     * Document-level lookup.
+     * @returns an empty list, always.
+     */
+    querySelectorAll() {
+      return []
+    },
   }
 
   const previousWindow = globalThis.window
   const previousDocument = globalThis.document
-  // These stay installed for the whole session: the plugin's effects call
-  // `document.createElement` when they run, long after the factory returned, so
-  // restoring the globals here would make style installation fail in a way that
-  // looks like a plugin bug.
+  const previousGlobalAdd = globalThis.addEventListener
+  const previousGlobalRemove = globalThis.removeEventListener
+  // These stay installed for the whole session rather than being restored after
+  // the factory returns. The plugin's effects call `document.createElement` and
+  // register `resize`/`scroll` handlers when they RUN, which is long after the
+  // factory has returned — restoring the globals here would make style
+  // installation and listener registration fail in a way that looks like a
+  // plugin bug.
   globalThis.window = sandboxWindow
   globalThis.document = sandboxDocument
+  // The Client half registers `resize`/`scroll` on `globalThis` directly, so
+  // those names must exist on the global object itself and not only on the
+  // `window` shim.
+  globalThis.addEventListener = (type, handler, options) => sandboxWindow.addEventListener(type, handler, options)
+  globalThis.removeEventListener = (type, handler, options) => sandboxWindow.removeEventListener(type, handler, options)
+  sandboxWindow.__previous = { previousWindow, previousDocument, previousGlobalAdd, previousGlobalRemove }
   // eslint-disable-next-line no-new-func
   const run = new Function('window', 'document', `${source}\n`)
   run(sandboxWindow, sandboxDocument)
