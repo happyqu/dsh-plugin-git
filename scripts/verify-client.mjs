@@ -32,7 +32,7 @@ import {
 const h = React.createElement
 
 const here = dirname(fileURLToPath(import.meta.url))
-const source = readFileSync(join(here, '..', 'lib', 'client.js'), 'utf8')
+const source = readFileSync(join(here, '..', 'dist', 'client.js'), 'utf8')
 
 let failures = 0
 let checks = 0

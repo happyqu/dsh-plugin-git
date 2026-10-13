@@ -8,7 +8,7 @@
     ".": {
       "default": "./lib/index.js"
     },
-    "./client": "./lib/client.js",
+    "./client": "./dist/client.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -16,7 +16,9 @@
     "docs",
     "cordis.patch.yml",
     "README.md",
-    "scripts/check-package.mjs"
+    "scripts/check-package.mjs",
+    "dist/client.js",
+    "scripts/build-client.mjs"
   ],
   "keywords": [
     "dsh",
@@ -43,9 +45,10 @@
     }
   },
   "scripts": {
-    "check": "node scripts/check-package.mjs",
-    "test": "node scripts/verify-client.mjs",
-    "prepack": "npm run check"
+    "check": "npm run build && node scripts/check-package.mjs",
+    "test": "npm run build && node scripts/verify-client.mjs",
+    "prepack": "npm run check",
+    "build": "node scripts/build-client.mjs"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -55,5 +58,8 @@
     "type": "git",
     "url": "git+https://github.com/happyqu/dsh-plugin-git.git"
   },
-  "homepage": "https://github.com/happyqu/dsh-plugin-git#readme"
+  "homepage": "https://github.com/happyqu/dsh-plugin-git#readme",
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
 }

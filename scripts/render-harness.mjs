@@ -522,7 +522,7 @@ export function hasText(tree, fragment) {
 }
 
 /**
- * Extract the plugin module from `lib/client.js` by running its
+ * Extract the plugin module from the built `dist/client.js` by running its
  * `__ModuleLoader__.load` call against a stub table.
  *
  * @param source - the file's source text.

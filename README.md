@@ -35,3 +35,7 @@ Git 功能按版本检测：旧版本使用兼容的状态读取、差异、丢�
 ## 许可证
 
 MIT
+
+## 客户端开发
+
+`lib/client.js` 只负责插件注册，界面模块按职责放在 `lib/client/`，中英文文案在 `lib/client/locales.js`。目录边界见[客户端架构](docs/client-architecture.md)。开发前运行 `npm ci`，修改后运行 `npm run build`，生成 DSH 加载的独立客户端脚本 `dist/client.js`。检查和打包时会自动构建，发布包包含生成的入口。
