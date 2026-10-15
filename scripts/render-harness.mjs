@@ -162,11 +162,16 @@ function useMemo(compute, deps) {
 
 /** React-alike namespace handed to the plugin factory. */
 export const React = {
-  createElement: (type, props, ...children) => ({
-    $$kind: 'element',
-    type,
-    props: { ...(props ?? {}), children: normalizeChildren(children) },
-  }),
+  createElement: (type, props, ...children) => {
+    const merged = { ...(props ?? {}) }
+    // Real React leaves `props.children` UNDEFINED when no child argument was
+    // passed and the props object did not set it. Always assigning `[]` broke
+    // every `props.children || [fallback]` in the Client half: `[]` is truthy, so
+    // such code took the empty branch and rendered nothing, making a working
+    // component look broken. Only a real child list may set the key.
+    if (children.length > 0) merged.children = normalizeChildren(children)
+    return { $$kind: 'element', type, props: merged }
+  },
   Fragment: Symbol('Fragment'),
   /**
    * `memo` is a render optimisation, not a semantic one: it only lets React skip
@@ -189,6 +194,25 @@ export const React = {
   useEffect,
   useCallback,
   useMemo,
+  /**
+   * `Children.toArray` flattens a node's children into a keyed array, dropping
+   * null/undefined/booleans. `cloneElement` copies an element with overridden
+   * props, and `isValidElement` asks whether a value is one. The Client half uses
+   * all three to rewrite a change row's children, so a missing shim aborts the
+   * suite mid-run — which is exactly what happened once that code landed. None of
+   * them performs a render, so implementing them here cannot mask a real bug.
+   */
+  Children: {
+    toArray: (children) => normalizeChildren(Array.isArray(children) ? children : [children]),
+  },
+  cloneElement: (element, props) => ({
+    $$kind: 'element',
+    type: element.type,
+    // Real React merges over the original props; `children` is replaced outright
+    // when supplied, which is the only case this Client half relies on.
+    props: { ...element.props, ...(props ?? {}) },
+  }),
+  isValidElement: (value) => value !== null && typeof value === 'object' && value.$$kind === 'element',
 }
 
 /** Flatten nested children arrays, matching React's behaviour. */
@@ -316,6 +340,23 @@ function bindRef(props, registry) {
       return null
     },
     /**
+     * Stand-in parent, so code that walks UP from a ref does not throw.
+     *
+     * Like `closest` above, it resolves to nothing: a plain tree has no ancestor
+     * chain, and `node.parentElement.closest(...)` must be able to answer "no
+     * such ancestor". Real code already guards that case, because a ref can be
+     * read after the node was detached.
+     */
+    parentElement: {
+      /**
+       * Ancestor lookup from the stand-in parent.
+       * @returns null, always.
+       */
+      closest() {
+        return null
+      },
+    },
+    /**
      * Descendant lookup, likewise absent on a fake node.
      * @returns null, always.
      */
@@ -329,6 +370,29 @@ function bindRef(props, registry) {
     querySelectorAll() {
       return []
     },
+    // Attribute reads/writes are used by code that keeps ARIA state in sync with a
+    // scroll position (`track.setAttribute('aria-valuenow', …)`). A real node has
+    // them, so omitting them crashed a timer AFTER every check had already passed —
+    // an exit-code-only failure that reads like a test bug. Store them so a test
+    // can inspect what the code set.
+    attributes: {},
+    /**
+     * Record an attribute value.
+     * @param name - the attribute name.
+     * @param value - the value to record.
+     */
+    setAttribute(name, value) { node.attributes[name] = String(value) },
+    /**
+     * Read a recorded attribute value.
+     * @param name - the attribute name.
+     * @returns the recorded value, or null.
+     */
+    getAttribute(name) { return Object.prototype.hasOwnProperty.call(node.attributes, name) ? node.attributes[name] : null },
+    /**
+     * Remove a recorded attribute.
+     * @param name - the attribute name.
+     */
+    removeAttribute(name) { delete node.attributes[name] },
   }
   ref.current = node
   registry.set(props.className, node)
@@ -362,6 +426,9 @@ function elementKey(element) {
 /** Render a children array, preserving index-based paths. */
 function renderChildren(children, path) {
   const out = []
+  // `children` is absent for an element created without any, which is the normal
+  // case for real React too — treat it as no children rather than throwing.
+  if (!Array.isArray(children)) return out
   for (let i = 0; i < children.length; i++) {
     const rendered = renderNode(children[i], `${path}[${i}]`)
     if (rendered === null) continue
@@ -660,7 +727,29 @@ export function loadClientModule(source, options = {}) {
   // `window` shim.
   globalThis.addEventListener = (type, handler, options) => sandboxWindow.addEventListener(type, handler, options)
   globalThis.removeEventListener = (type, handler, options) => sandboxWindow.removeEventListener(type, handler, options)
-  sandboxWindow.__previous = { previousWindow, previousDocument, previousGlobalAdd, previousGlobalRemove }
+  // Scroll logic walks up from a node looking for the nearest scrollable
+  // ancestor via `getComputedStyle(parent).overflowY`. There is no layout here,
+  // so report "not scrollable": the same answer a real element with default
+  // `overflow: visible` gives, which keeps that walk terminating rather than
+  // throwing `getComputedStyle is not defined`.
+  const previousComputedStyle = globalThis.getComputedStyle
+  globalThis.getComputedStyle = () => ({ overflowY: 'visible', overflowX: 'visible', position: 'static' })
+  // Frame callbacks: run once, asynchronously, and hand back a cancellable id.
+  const previousRaf = globalThis.requestAnimationFrame
+  const previousCancelRaf = globalThis.cancelAnimationFrame
+  const pendingFrames = new Map()
+  let frameSeq = 0
+  globalThis.requestAnimationFrame = (callback) => {
+    const id = ++frameSeq
+    pendingFrames.set(id, setTimeout(() => { pendingFrames.delete(id); callback(0) }, 0))
+    return id
+  }
+  globalThis.cancelAnimationFrame = (id) => {
+    const timer = pendingFrames.get(id)
+    if (timer !== undefined) { clearTimeout(timer); pendingFrames.delete(id) }
+  }
+  sandboxWindow.__previous = { previousWindow, previousDocument, previousGlobalAdd, previousGlobalRemove,
+    previousComputedStyle, previousRaf, previousCancelRaf }
   // eslint-disable-next-line no-new-func
   const run = new Function('window', 'document', `${source}\n`)
   run(sandboxWindow, sandboxDocument)
