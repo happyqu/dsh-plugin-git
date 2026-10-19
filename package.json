@@ -1,6 +1,6 @@
 {
   "name": "@happyqu/dsh-plugin-git",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "description": "Git workbench for deepseek-harness: changelists, staging, history, branches, stashes and optional AI assistance",
   "type": "module",
   "main": "lib/index.js",
@@ -41,7 +41,8 @@
         "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-layout",
-        "@deepseek-ai/dsh-client-ui-conversation"
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ]
     }
   },
