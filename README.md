@@ -1,6 +1,6 @@
 # DSH Git 插件
 
-为 DeepSeek Harness（DSH）提供可视化 Git 工作台。在 DSH 中查看改动、管理改动列表、提交代码、切换分支和浏览历史，无需频繁切换到终端。
+为 DeepSeek Harness（DSH）提供可视化 Git 工作台。从会话标题栏的 Git 操作区打开快捷弹窗或浮层工作台，管理当前会话工作区的本地仓库：查看改动、管理改动列表、提交代码、切换分支和浏览历史。
 
 **npm 包名：`@happyqu/dsh-plugin-git`**
 
@@ -12,7 +12,7 @@
 
 1. 安装 [Git](https://git-scm.com/downloads)，确保 `git` 在 PATH 中可用。
 2. 在 DSH 中打开 **插件 → 添加插件**，输入 `@happyqu/dsh-plugin-git` 并安装、启用。
-3. 打开项目工作区，通过顶部 Git 入口打开弹窗或完整工作台。
+3. 在 DSH 会话中打开已有 Git 仓库所在的项目工作区，通过会话标题栏的 Git 操作区打开快捷弹窗或完整工作台。
 
 本包是 DSH 插件，需要在 DSH 中加载使用。使用者无需自行构建客户端。
 
