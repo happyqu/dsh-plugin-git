@@ -17,6 +17,7 @@
     "cordis.patch.yml",
     "README.md",
     "scripts/check-package.mjs",
+    "scripts/check-commit.mjs",
     "dist/client.js",
     "scripts/build-client.mjs"
   ],
@@ -46,6 +47,7 @@
   },
   "scripts": {
     "check": "npm run build && node scripts/check-package.mjs",
+    "check:commit": "node scripts/check-commit.mjs",
     "test": "npm run build && node scripts/verify-client.mjs",
     "prepack": "npm run check",
     "build": "node scripts/build-client.mjs"
