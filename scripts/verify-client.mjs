@@ -1710,7 +1710,7 @@ console.log('\n--- simplified workbench branch layout ---')
     walk(group('remotes')).some((node) => node.props?.['data-branch-group'] === 'remote:origin') &&
     textOf(findAll(group('remote:origin'), 'summary')[0]).includes('origin (1)'))
   const headingIcon = (key, icon) => walk(findAll(group(key), 'summary')[0]).some((node) => node.name === icon)
-  check('branch tree headings use branch, folder and remote icons', headingIcon('locals', 'IconBranch') &&
+  check('branch tree headings use folder and remote icons distinct from branch rows', headingIcon('locals', 'IconFolder') &&
     headingIcon('local::feature', 'IconFolder') && headingIcon('remotes', 'IconRemote') && headingIcon('remote:origin', 'IconRemote'))
   check('the remote heading retains fetch and prune controls', ['fetch', 'prune'].every((action) =>
     findAll(group('remote:origin'), 'button').some((button) => button.props['data-remote-action'] === action && button.props['data-remote-target'] === 'origin')))
