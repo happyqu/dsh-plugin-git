@@ -2531,6 +2531,56 @@ console.log('\n--- the launcher toggles the single window closed ---')
     walk(tree).some((node) => node.props?.['data-mode'] !== undefined && node.props['data-mode'] !== 'closed'))
 }
 
+console.log('\n--- tag clicks directly create a branch without detached checkout ---')
+{
+  let header = await renderChips(healthyHandlers({ refs: () => ({ ...REFS, tags: [{ ...REFS.tags[0], sha: 'b'.repeat(40), commitSha: COMMIT_DETAIL.sha }] }) }))
+  const rootProps = { connection: mounted.rpc, t: mounted.t }
+  const chooseTag = async () => {
+    findAll(header, 'button').find((node) => node.props['data-chip'] === 'branch').props.onClick({
+      currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) },
+    })
+    header = await flush(GitApp, rootProps)
+    const toggle = findAll(header, 'button').find((node) => node.props['data-picker-toggle'] === 'tags')
+    if (!toggle.props['aria-expanded']) toggle.props.onClick()
+    header = await flush(GitApp, rootProps)
+    findAll(header, 'button').find((node) => node.props['data-ref'] === 'v0.1.0').props.onClick()
+    header = await flush(GitApp, rootProps)
+  }
+  await chooseTag()
+  check('clicking a tag performs no write', !mounted.rpc.calls.some((call) => call.method.startsWith('write.')))
+  check('clicking a tag opens no version browser', !walk(header).some((node) => node.props?.['data-history-commit']) &&
+    !mounted.rpc.calls.some((call) => call.method === 'commitGraph'))
+  check('tag selection keeps the current branch indicator', hasText(findAll(header, 'button').find((node) => node.props['data-chip'] === 'branch'), 'main'))
+  let dialog = walk(header).find((node) => node.props?.role === 'dialog' && node.type === 'form')
+  check('developing from a tag opens a named branch form', dialog?.props['aria-label'] === t('wb.createBranchFromTag') &&
+    findAll(dialog, 'button').find((node) => node.props.type === 'submit').props.disabled)
+  check('tag start point is fixed and checkout cannot be unchecked', !findAll(dialog, 'input').some((node) => node.props.type === 'checkbox' && node.props.checked === true))
+  findAll(dialog, 'button').find((node) => textOf(node) === t('action.cancel')).props.onClick()
+  header = await flush(GitApp, rootProps)
+  check('cancelling branch creation leaves the worktree untouched', !mounted.rpc.calls.some((call) => call.method.startsWith('write.')))
+  await chooseTag()
+  dialog = walk(header).find((node) => node.props?.role === 'dialog' && node.type === 'form')
+  findAll(dialog, 'input').find((node) => node.props.name === 'name').props.onChange({ target: { value: 'release/fix' } })
+  header = await flush(GitApp, rootProps)
+  dialog = walk(header).find((node) => node.props?.role === 'dialog' && node.type === 'form')
+  dialog.props.onSubmit({ preventDefault() {} })
+  header = await flush(GitApp, rootProps)
+  const calls = mounted.rpc.calls.filter((call) => call.method === 'write.workbenchAction')
+  const payload = calls[0]?.payload
+  check('tag development creates and switches to a branch with one confirmed write', calls.length === 1 && payload.confirm === true &&
+    payload.action === 'createBranch' && payload.parameters.name === 'release/fix' &&
+    payload.parameters.startPoint === 'refs/tags/v0.1.0' && payload.parameters.checkout === true)
+  check('tag development never sends detached checkout', !mounted.rpc.calls.some((call) => call.method === 'write.checkout' || call.payload?.action === 'checkout'))
+}
+{
+  const detachedStatus = { ...STATUS, branch: { ...STATUS.branch, head: '(detached)', oid: 'c'.repeat(40), detached: true, upstream: null } }
+  const header = await renderChips(healthyHandlers({ status: () => detachedStatus,
+    refs: () => ({ ...REFS, tags: [{ name: 'v0.1.0', ref: 'refs/tags/v0.1.0', sha: 'd'.repeat(40), commitSha: 'c'.repeat(40) }] }) }))
+  const chip = findAll(header, 'button').find((node) => node.props['data-chip'] === 'branch')
+  check('detached header identifies annotated tag and detached state', hasText(chip, t('wb.detachedState', { name: 'v0.1.0' })))
+}
+
+
 console.log(`\n${checks - failures}/${checks} checks passed`)
 if (failures > 0) {
   console.error(`${failures} FAILED`)
