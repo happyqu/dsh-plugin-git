@@ -788,6 +788,70 @@ function GitApp(props) {
   return currentHarness(props)
 }
 
+console.log('\n--- flat branch picker and collapsed tags ---')
+{
+  const branches = Array.from({ length: 12 }, (_, i) => ({
+    name: `feature/${i}`, ref: `refs/heads/feature/${i}`, committerDate: i + 1,
+    author: 'Branch author', sha: 'abcdef0123456789', subject: 'A detailed commit description',
+  }))
+  const remotes = branches.map((branch) => ({ ...branch, name: `origin/${branch.name}`, ref: `refs/remotes/origin/${branch.name}` }))
+  const tags = Array.from({ length: 12 }, (_, i) => ({ name: `v0.1.${i}`, ref: `refs/tags/v0.1.${i}` }))
+  let tree = await renderChips(healthyHandlers({ refs: () => ({ ...REFS, branches: [REFS.branches[0], ...branches], remotes, tags }) }))
+  const rootProps = { connection: mounted.rpc, t: mounted.t }
+  findAll(tree, 'button').find((node) => node.props['data-chip'] === 'branch').props.onClick({
+    currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) },
+  })
+  tree = await flush(GitApp, rootProps)
+  const rows = (prefix) => findAll(tree, 'button').filter((node) => node.props.className?.includes('dshgit-pickrow') && node.props['data-ref']?.startsWith(prefix))
+  const tagsToggle = () => findAll(tree, 'button').find((node) => node.props['data-picker-toggle'] === 'tags')
+  const more = (group) => findAll(tree, 'button').find((node) => node.props['data-picker-more'] === group)
+  check('picker includes current branch within the first five local branches', rows('feature/').length === 4 &&
+    rows('origin/').length === 5 && rows('main').length === 1 && rows('feature/')[0]?.props['data-ref'] === 'feature/11')
+  const current = rows('main')[0]
+  check('picker marks the current local branch with the same dot as the workbench', current.props['aria-current'] === 'true' && current.props.disabled === true &&
+    walk(current).some((node) => node.props?.className === 'dshgit-tipdot dshgit-branch-current-dot'))
+  check('picker has no separate current-branch heading', !walk(tree).some((node) => node.props?.className === 'dshgit-pickgroup' && textOf(node) === t('picker.current')))
+  const first = rows('feature/')[0]
+  check('picker rows show a branch icon and name without commit metadata', walk(first).some((node) => node.name === 'IconBranch') &&
+    textOf(first).includes('feature/11') && !textOf(first).includes('Branch author') && !textOf(first).includes('A detailed commit description'))
+  check('picker tooltips retain author, commit hash and description', first.props.title.includes('Branch author') &&
+    first.props.title.includes('abcdef0') && first.props.title.includes('A detailed commit description'))
+  check('remote rows retain the full remote prefix in their visible names', textOf(rows('origin/')[0], '').includes('origin/feature/11'))
+  more('locals').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  check('picker shows only five more branches on each click', rows('feature/').length === 9 && rows('main').length === 1 && rows('origin/').length === 5)
+  more('locals').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  check('picker finishes with remaining branches and offers collapse', rows('feature/').length === 12 && textOf(more('locals')) === t('picker.showLess'))
+  more('locals').props.onClick()
+  more('remotes').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  check('picker can collapse local branches and independently extend remotes', rows('feature/').length === 4 && rows('main').length === 1 && rows('origin/').length === 10)
+  check('picker tags start collapsed', rows('v').length === 0 && tagsToggle()?.props['aria-expanded'] === false)
+  tagsToggle().props.onClick()
+  tree = await flush(GitApp, rootProps)
+  check('picker tags first expand to five rows', rows('v').length === 5)
+  check('picker tag rows have a tag icon', walk(rows('v')[0]).some((node) => node.name === 'IconTag'))
+  more('tags').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  check('picker tags also load five per click', rows('v').length === 10)
+  tagsToggle().props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const search = () => findAll(tree, 'input').find((node) => node.props.className === 'dshgit-pickerinput')
+  search().props.onChange({ currentTarget: { value: 'feature/' } })
+  tree = await flush(GitApp, rootProps)
+  check('picker search covers all branches beyond initial batches', rows('feature/').length === 12 && rows('origin/').length === 12 && !more('locals') && !more('remotes'))
+  search().props.onChange({ currentTarget: { value: 'v0.1' } })
+  tree = await flush(GitApp, rootProps)
+  check('picker search finds all collapsed tags', rows('v').length === 12)
+  search().props.onChange({ currentTarget: { value: '' } })
+  tree = await flush(GitApp, rootProps)
+  check('clearing picker search restores batches and collapsed tags', rows('v').length === 0 && rows('feature/').length === 4 && rows('main').length === 1 && rows('origin/').length === 10)
+  tagsToggle().props.onClick()
+  tree = await flush(GitApp, rootProps)
+  check('reopening tags resets to the first batch', rows('v').length === 5)
+}
+
 console.log('\n--- everyday header actions ---')
 {
   let header = await renderChips()
@@ -1425,7 +1489,7 @@ console.log('\n--- graph tab ---')
   // The live sidebar is the branch list, not a lane legend.
   check('graph sidebar lists the refs',
     walk(tree).some((node) => String(node.props?.className ?? '').includes('dshgit-sidebar')) &&
-    hasText(tree, 'origin/main'))
+    walk(tree).some((node) => node.props?.['data-branch-ref'] === 'refs/remotes/origin/main'))
 }
 
 console.log('\n--- compare tab ---')
@@ -1580,6 +1644,124 @@ console.log('\n--- older Host without the remotes method ---')
   check('repository status remains available when remotes fail', hasText(tree, ROOT) && hasText(tree, 'main'))
 }
 
+console.log('\n--- grouped workbench branch lists ---')
+{
+  const locals = Array.from({ length: 250 }, (_, i) => ({ name: `feature/branch-${i}`, ref: `refs/heads/feature/branch-${i}`, committerDate: i + 1 }))
+  const origin = locals.map((branch) => ({ ...branch, name: `origin/${branch.name}`, ref: `refs/remotes/origin/${branch.name}` }))
+  const upstream = locals.map((branch) => ({ ...branch, name: `upstream/${branch.name}`, ref: `refs/remotes/upstream/${branch.name}` }))
+  const tags = Array.from({ length: 25 }, (_, i) => ({ name: `v0.2.${i}`, ref: `refs/tags/v0.2.${i}` }))
+  let sidebarTree = await renderApp(healthyHandlers({
+    refs: () => ({ branches: [REFS.branches[0], ...locals], remotes: [...origin, ...upstream], tags }),
+    remotes: () => [...REMOTES, { name: 'upstream' }],
+  }))
+  sidebarTree = await selectModule(sidebarTree, 'graph')
+  const rootProps = { connection: mounted.rpc, t: mounted.t }
+  const group = (key) => walk(sidebarTree).find((node) => node.props?.['data-branch-group'] === key)
+  const branchRows = (key) => findAll(group(key), 'button').filter((node) => node.props['data-branch-ref'])
+  check('hundreds of locals start inside a collapsed prefix folder while current stays visible',
+    branchRows('locals').length === 1 && group('local::feature').props.open === false &&
+    branchRows('locals')[0]?.props['data-branch-ref'] === 'refs/heads/main')
+  check('remote prefix folders stay collapsed independently',
+    branchRows('remote:origin').length === 0 && branchRows('remote:upstream').length === 0)
+  check('multiple remotes retain their shared parent group', group('remotes') !== undefined)
+  check('closed tags render no tag rows', group('tags').props.open === false && findAll(group('tags'), 'button').length === 0)
+  group('local::feature').props.onToggle({ currentTarget: { open: true } })
+  group('remote:origin:feature').props.onToggle({ currentTarget: { open: true } })
+  group('tags').props.onToggle({ currentTarget: { open: true } })
+  sidebarTree = await flush(GitApp, rootProps)
+  check('opening folders reveals their complete lists without pagination', branchRows('locals').length === 251 &&
+    branchRows('remote:origin').length === 250 && branchRows('remote:upstream').length === 0 &&
+    findAll(group('tags'), 'button').length === 25)
+  group('local::feature').props.onToggle({ currentTarget: { open: false } })
+  group('tags').props.onToggle({ currentTarget: { open: false } })
+  sidebarTree = await flush(GitApp, rootProps)
+  check('closing a large folder unmounts its branch rows', branchRows('locals').length === 1)
+  const search = () => findAll(sidebarTree, 'input').find((node) => node.props['aria-label'] === t('wb.search'))
+  search().props.onChange({ currentTarget: { value: 'branch-0' } })
+  sidebarTree = await flush(GitApp, rootProps)
+  check('search finds branches inside all closed folders', branchRows('locals').length === 1 &&
+    branchRows('remote:origin').length === 1 && branchRows('remote:upstream').length === 1 && group('local::feature').props.open === true)
+  search().props.onChange({ currentTarget: { value: '' } })
+  sidebarTree = await flush(GitApp, rootProps)
+  check('clearing search restores manually folded groups', group('local::feature').props.open === false && group('tags').props.open === false)
+  search().props.onChange({ currentTarget: { value: 'v0.2.' } })
+  sidebarTree = await flush(GitApp, rootProps)
+  check('tag search opens the group and covers all tags', group('tags').props.open === true && findAll(group('tags'), 'button').length === 25)
+}
+
+console.log('\n--- simplified workbench branch layout ---')
+{
+  const branches = [
+    { ...REFS.branches[0], committerDate: 1000 },
+    { name: 'release', ref: 'refs/heads/release', committerDate: 2000 },
+    { name: 'hotfix/security', ref: 'refs/heads/hotfix/security', committerDate: 500 },
+    { name: 'feature/zebra', ref: 'refs/heads/feature/zebra', committerDate: 4000 },
+    { name: 'feature/apple', ref: 'refs/heads/feature/apple', committerDate: 1 },
+  ]
+  let layout = await renderApp(healthyHandlers({ refs: () => ({ ...REFS, branches, tags: [] }) }))
+  layout = await selectModule(layout, 'graph')
+  const rootProps = { connection: mounted.rpc, t: mounted.t }
+  const group = (key) => walk(layout).find((node) => node.props?.['data-branch-group'] === key)
+  const localChildren = group('locals').children.find((node) => node.props?.className === 'dshgit-branch-children').children
+  const order = localChildren.map((node) => node.props?.['data-branch-group'] || findAll(node, 'button').find((button) => button.props['data-branch-ref'])?.props['data-branch-ref'])
+  check('workbench places directories first and sorts sibling names independently of commit dates',
+    JSON.stringify(order) === JSON.stringify(['local::feature', 'local::hotfix', 'refs/heads/main', 'refs/heads/release']), JSON.stringify(order))
+  check('a single remote keeps the remote heading and nested origin group', group('remotes') &&
+    walk(group('remotes')).some((node) => node.props?.['data-branch-group'] === 'remote:origin') &&
+    textOf(findAll(group('remote:origin'), 'summary')[0]).includes('origin (1)'))
+  const headingIcon = (key, icon) => walk(findAll(group(key), 'summary')[0]).some((node) => node.name === icon)
+  check('branch tree headings use branch, folder and remote icons', headingIcon('locals', 'IconBranch') &&
+    headingIcon('local::feature', 'IconFolder') && headingIcon('remotes', 'IconRemote') && headingIcon('remote:origin', 'IconRemote'))
+  check('the remote heading retains fetch and prune controls', ['fetch', 'prune'].every((action) =>
+    findAll(group('remote:origin'), 'button').some((button) => button.props['data-remote-action'] === action && button.props['data-remote-target'] === 'origin')))
+  check('empty tag groups are hidden', !group('tags'))
+  const current = findAll(group('locals'), 'button').find((button) => button.props['data-branch-ref'] === 'refs/heads/main')
+  check('current branches retain their branch glyph alongside the current marker', walk(current).some((node) => node.name === 'IconBranch') &&
+    walk(current).some((node) => node.props?.['aria-label'] === t('wb.current')))
+  check('upstream is available in the tooltip without cluttering the branch row', current.props.title.includes('origin/main') &&
+    !textOf(current).includes('origin/main') && textOf(current).includes('↑2') && textOf(current).includes('↓1'))
+  group('local::feature').props.onToggle({ currentTarget: { open: true } })
+  layout = await flush(GitApp, rootProps)
+  const names = findAll(group('local::feature'), 'button').filter((button) => button.props['data-branch-ref']).map((button) => button.props['data-branch-ref'])
+  check('branches inside a directory also sort by name', JSON.stringify(names) === JSON.stringify(['refs/heads/feature/apple', 'refs/heads/feature/zebra']), JSON.stringify(names))
+}
+
+console.log('\n--- header local checkout confirmation ---')
+for (const entry of ['row', 'quick action', 'context menu']) {
+  let header = await renderChips()
+  const rootProps = { connection: mounted.rpc, t: mounted.t }
+  const chooseBranch = async () => {
+    findAll(header, 'button').find((node) => node.props['data-chip'] === 'branch').props.onClick({
+      currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) },
+    })
+    header = await flush(GitApp, rootProps)
+    const row = walk(header).find((node) => node.props?.['data-picker-branch'] === 'refs/heads/feature/新功能')
+    if (entry === 'row') findAll(row, 'button').find((node) => node.props['data-ref'] === 'feature/新功能').props.onClick()
+    else if (entry === 'quick action') findAll(row, 'button').find((node) => node.props['data-branch-action'] === 'checkout').props.onClick({ preventDefault() {}, stopPropagation() {} })
+    else {
+      row.props.onContextMenu({ clientX: 100, clientY: 120, preventDefault() {}, stopPropagation() {} })
+      header = await flush(GitApp, rootProps)
+      const menu = walk(header).find((node) => node.props?.className === 'dshgit-contextmenu')
+      findAll(menu, 'button').find((node) => textOf(node).includes(t('wb.checkout'))).props.onClick()
+    }
+    header = await flush(GitApp, rootProps)
+  }
+  await chooseBranch()
+  let dialog = walk(header).find((node) => node.props?.role === 'alertdialog')
+  check(`header ${entry} asks before switching local branch`, dialog && hasText(dialog, 'feature/新功能') &&
+    !mounted.rpc.calls.some((call) => call.method === 'write.checkout'))
+  findAll(dialog, 'button').find((node) => textOf(node) === t('action.cancel')).props.onClick()
+  header = await flush(GitApp, rootProps)
+  check(`cancelling header ${entry} performs no checkout`, !mounted.rpc.calls.some((call) => call.method === 'write.checkout'))
+  await chooseBranch()
+  dialog = walk(header).find((node) => node.props?.role === 'alertdialog')
+  findAll(dialog, 'button').find((node) => textOf(node) === t('action.switchBranch')).props.onClick()
+  header = await flush(GitApp, rootProps)
+  const checkouts = mounted.rpc.calls.filter((call) => call.method === 'write.checkout')
+  check(`confirming header ${entry} switches once to the intended branch`, checkouts.length === 1 &&
+    checkouts[0].payload.ref === 'refs/heads/feature/新功能' && checkouts[0].payload.confirm === true)
+}
+
 console.log('\n--- write flow asks for confirmation ---')
 {
   const captured = { confirmed: [] }
@@ -1602,6 +1784,8 @@ console.log('\n--- write flow asks for confirmation ---')
   // is no `data.branch` prop and no `action.checkout` title (the label is
   // `wb.checkout`), so select the graph module and match the action attribute.
   tree = await selectModule(tree, 'graph')
+  walk(tree).find((node) => node.props?.['data-branch-group'] === 'local::feature').props.onToggle({ currentTarget: { open: true } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
   const branchRow = walk(tree).find((node) =>
     node.$$kind === 'host' &&
     node.props?.['data-branch-action'] === 'checkout' &&
@@ -1613,11 +1797,19 @@ console.log('\n--- write flow asks for confirmation ---')
     branchRow === undefined ? 'no row' : JSON.stringify({ disabled: branchRow.props.disabled, label: branchRow.props['aria-label'] }))
   branchRow.props.onClick({ stopPropagation() {} })
   tree = await flush(GitApp, { connection: mounted.rpc, t })
-  // A local-branch checkout now goes straight through with `confirm: true` in ONE
-  // call: `openWorkbench` treats the confirmation as already given, so there is no
-  // confirm-then-retry round trip. (The dialog is for the actions that need
-  // parameters, e.g. a NEW branch name.) Assert that single-call contract.
-  check('the checkout is sent pre-confirmed in one call',
+  let dialog = walk(tree).find((node) => node.props?.role === 'alertdialog')
+  check('workbench checkout asks before writing', dialog && hasText(dialog, 'feature/新功能') && captured.confirmed.length === 0)
+  findAll(dialog, 'button').find((node) => textOf(node) === t('action.cancel')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('cancelling workbench checkout performs no write', captured.confirmed.length === 0)
+  // Double-click and the checkout icon both route through the same confirmation.
+  findAll(tree, 'button').find((node) => node.props['data-branch-ref'] === 'refs/heads/feature/新功能').props.onDoubleClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  dialog = walk(tree).find((node) => node.props?.role === 'alertdialog')
+  check('double-clicking a workbench branch also waits for confirmation', dialog && captured.confirmed.length === 0)
+  findAll(dialog, 'button').find((node) => textOf(node) === t('action.switchBranch')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('confirmed workbench checkout is sent in one call',
     captured.confirmed.length === 1 && captured.confirmed[0] === true,
     JSON.stringify(captured.confirmed))
   check('the checkout targets the branch that was clicked',
@@ -2012,6 +2204,8 @@ console.log('\n--- branch delete is confirmed, merge is not destructive ---')
   // Branch rows (with their `⋯` menu) render in the GRAPH module's sidebar now, not
   // on the changes tab.
   tree = await selectModule(tree, 'graph')
+  walk(tree).find((node) => node.props?.['data-branch-group'] === 'local::feature').props.onToggle({ currentTarget: { open: true } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
   const branchRow = walk(tree).find((node) => node.$$kind === 'host' &&
     node.props?.['data-branch-action'] === 'more' &&
     node.props?.['data-branch-target'] === 'refs/heads/feature/新功能')
