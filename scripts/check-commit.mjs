@@ -131,6 +131,80 @@ assert.match(job.result.error.message, /勿重复提交/)
 await rm(join(hooks, 'post-commit'))
 check('native staged commit checks HEAD after cancellation and avoids false retry advice')
 
+// Reproduce a stat-only dirty entry under Windows-style checkout conversion.
+// Status reads deliberately cannot refresh the real index (--no-optional-locks).
+await run(['config', 'core.autocrlf', 'true'])
+const ghost = 'status clean 中文.txt', changed = 'status-selected.txt', outside = 'status-staged.txt'
+await writeFile(join(root, ghost), 'same\nlines\n')
+await writeFile(join(root, changed), 'before\n')
+result = await commitPaths(repo, { paths: [ghost, changed], message: 'status fixture' })
+assert.equal(result.ok, true, result.message)
+await writeFile(join(root, outside), 'staged version\n')
+await run(['add', '--', outside])
+await writeFile(join(root, outside), 'unstaged version\n')
+for (const includeGhost of [false, true]) {
+  const ghostBytes = Buffer.from(includeGhost ? 'same\nlines\n' : 'same\r\nlines\r\n')
+  await writeFile(join(root, ghost), ghostBytes)
+  await writeFile(join(root, changed), includeGhost ? 'third\n' : 'second\n')
+  const beforeStatus = await repo.status({ force: true, details: false })
+  assert(beforeStatus.files.some(file => file.path === ghost), 'Fixture must reproduce a stat-only modified entry')
+  assert.equal(await run(['--no-optional-locks', 'diff', '--', ghost]), '')
+  const outsideFiles = beforeStatus.files.filter(file => ![ghost, changed].includes(file.path))
+  const outsideIndex = (await run(['ls-files', '--stage'])).split('\n').filter(line => ![ghost, changed].some(path => line.endsWith('\t' + path)))
+  const selectedPaths = includeGhost ? [changed, ghost] : [changed]
+  result = await commitPaths(repo, { paths: selectedPaths, message: 'refresh stat-only entry' })
+  assert.equal(result.ok, true, result.message)
+  assert.deepEqual(await readFile(join(root, ghost)), ghostBytes, 'Refresh must not rewrite worktree bytes')
+  const afterStatus = await repo.status({ force: true, details: false })
+  assert.deepEqual(afterStatus.files, outsideFiles, 'Only phantom and committed entries should disappear')
+  assert.deepEqual((await run(['ls-files', '--stage'])).split('\n').filter(line => ![ghost, changed].some(path => line.endsWith('\t' + path))), outsideIndex,
+    'Refresh must preserve every outside staged version')
+  assert.equal(await run(['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD']), changed)
+  check(includeGhost ? 'selected CRLF/LF phantom clears without staging outside changes' : 'unselected CRLF/LF phantom clears after scoped commit')
+}
+await writeFile(join(root, ghost), 'same\r\nlines\r\n')
+await writeFile(join(root, changed), 'fourth\n')
+const ghostIndex = await run(['show', ':' + ghost])
+const originalWrite = repo.runWrite.bind(repo)
+let raced = false
+repo.runWrite = async (args, options) => {
+  if (args[0] === 'add' && options?.env?.GIT_INDEX_FILE?.endsWith('refreshed-index')) {
+    raced = true
+    await writeFile(join(root, ghost), 'racing edit\r\n')
+  }
+  return originalWrite(args, options)
+}
+try { result = await commitPaths(repo, { paths: [changed], message: 'edit during stat refresh' }) }
+finally { repo.runWrite = originalWrite }
+assert.equal(result.ok, true, result.message)
+assert(raced, 'Race fixture must edit between comparison and rehash')
+assert.equal(await run(['show', ':' + ghost]), ghostIndex, 'Racing content must not enter the real index')
+assert.equal(await readFile(join(root, ghost), 'utf8'), 'racing edit\r\n')
+assert.equal(await run(['show', ':' + outside]), 'staged version')
+assert.equal(await readFile(join(root, outside), 'utf8'), 'unstaged version\n')
+check('edit racing with stat refresh stays unstaged and preserves outside staged content')
+await writeFile(join(root, ghost), 'same\r\nlines\r\n')
+await writeFile(join(root, changed), 'fifth\n')
+let refreshFailed = false
+repo.runWrite = async (args, options) => {
+  if (args[0] === 'add' && options?.env?.GIT_INDEX_FILE?.endsWith('refreshed-index')) {
+    refreshFailed = true
+    return { code: 128, stdout: '', stderr: 'injected stat refresh failure' }
+  }
+  return originalWrite(args, options)
+}
+try { result = await commitPaths(repo, { paths: [changed], message: 'optional refresh failure' }) }
+finally { repo.runWrite = originalWrite }
+assert(refreshFailed)
+assert.equal(result.ok, true, result.message)
+assert.match(result.stderr, /injected stat refresh failure/)
+assert.equal(await run(['show', ':' + ghost]), ghostIndex)
+assert.equal(await run(['show', ':' + outside]), 'staged version')
+assert.equal(await run(['show', 'HEAD:' + changed]), 'fifth')
+await assert.rejects(stat(join(root, '.git', 'index.lock')), { code: 'ENOENT' })
+check('optional stat refresh failure preserves a successful commit and restored index')
+await run(['config', 'core.autocrlf', 'false'])
+
 if (process.argv.includes('--lfs')) {
   await run(['lfs', 'version']); await run(['lfs', 'install', '--local'])
   await writeFile(join(root, '.gitattributes'), '*.bin filter=lfs diff=lfs merge=lfs -text\n')

@@ -887,14 +887,14 @@ export function createRpcStub(handlers) {
        * @param request - `{ method, payload }`.
        * @returns the envelope the Host would produce.
        */
-      async call(channel, endpoint, request) {
-        calls.push({ channel, endpoint, method: request.method, payload: request.payload })
+      async call(channel, endpoint, request, signal) {
+        calls.push({ channel, endpoint, method: request.method, payload: request.payload, signal })
         const handler = handlers[request.method]
         if (handler === undefined) {
           return { ok: false, error: { code: 'git/unknown-method', message: `no stub for ${request.method}` } }
         }
         try {
-          const value = await handler(request.payload)
+          const value = await handler(request.payload, signal)
           return { ok: true, value }
         } catch (error) {
           return {

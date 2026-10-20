@@ -26,6 +26,7 @@ import {
   hasText,
   refNode,
   React,
+  runCleanups,
 } from './render-harness.mjs'
 
 /** Shorthand for React.createElement, matching the plugin's own style. */
@@ -176,7 +177,7 @@ const COMMIT_DETAIL = {
 
 const CONFIG = {
   gitPath: '', defaultRepo: '', similarityThreshold: 50, autoBlame: true, blameChunkLines: 2000,
-  historyLimit: 300, aiEnabled: true, aiProvider: '', aiModel: '', locale: '',
+  historyLimit: 300, aiEnabled: true, aiProvider: '', aiModel: '', aiExcludePatterns: '', locale: '',
 }
 
 const DIAGNOSTICS = {
@@ -1165,7 +1166,7 @@ console.log('\n--- workbench Commit explains missing text and clears a mixed cha
   findAll(full, 'button').find((node) => String(node.props.className).includes('dshgit-commit-primary')).props.onClick()
   full = await flush(GitApp, { connection: mounted.rpc, t })
   check('empty message shows a visible explanation and does not write',
-    hasText(full, t('commit.requiredMessage')) &&
+    walk(full).some((node) => String(node.props?.className).includes('dshgit-toast') && hasText(node, t('commit.requiredMessage'))) &&
     !mounted.rpc.calls.some((call) => call.method.startsWith('write.')))
   findAll(full, 'textarea').find((node) => node.props.placeholder === t('commit.placeholderMessage'))
     .props.onChange({ currentTarget: { value: 'feat: all files' } })
@@ -1540,6 +1541,27 @@ console.log('\n--- settings tab ---')
     JSON.stringify(findAll(tree, 'button').filter((n) => String(n.props.className).includes('dshgit-rowbtn')).map(textOf)))
 }
 
+console.log('\n--- AI settings expose independent diff exclusions ---')
+{
+  findAll(tree, 'button').find((node) => textOf(node) === t('settings.ai')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  let rules = findAll(tree, 'textarea').find((node) => node.props['aria-label'] === t('settings.aiExclude'))
+  const modelCard = walk(tree).find((node) => node.props?.['data-settings-card'] === 'ai-model')
+  const contextCard = walk(tree).find((node) => node.props?.['data-settings-card'] === 'ai-context')
+  check('AI diff exclusions live in a separate context card', contextCard && hasText(contextCard, t('settings.aiContext')) &&
+    findAll(contextCard, 'textarea').length === 1 && findAll(modelCard, 'textarea').length === 0)
+  check('AI exclusions have an editable multiline setting', rules && !rules.props.disabled && rules.props.placeholder.includes('!dist/important.js'))
+  check('AI exclusion defaults are filled into the editable value', rules.props.value.includes('**/dist/**') && rules.props.value.includes('*.map') && rules.props.value.includes('package-lock.json'))
+  rules.props.onChange({ target: { value: 'dist/**\n!dist/important.js' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  rules = findAll(tree, 'textarea').find((node) => node.props['aria-label'] === t('settings.aiExclude'))
+  rules.props.onBlur()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('AI exclusions persist without changing file selection', mounted.rpc.calls.some((call) =>
+    call.method === 'setConfig' && call.payload.patch.aiExcludePatterns === 'dist/**\n!dist/important.js') &&
+    !mounted.rpc.calls.some((call) => call.method === 'updateChangelist'))
+}
+
 /* ------------------------------------------------------------------ *
  * States and failures
  * ------------------------------------------------------------------ */
@@ -1912,6 +1934,83 @@ console.log('\n--- AI assist ---')
   tree = await flush(GitApp, { connection: mounted.rpc, t })
   check('an unavailable model is reported as a notice, not an error',
     hasText(tree, '没有可用的模型服务'), textOf(tree).slice(-400))
+  check('unavailable model releases the commit controls', !findAll(tree, 'button').find((node) => String(node.props.className).includes('dshgit-commit-primary'))?.props.disabled)
+}
+
+console.log('\n--- AI generation stays compact and cancellable ---')
+{
+  let releaseContext, releaseModel, preparingSignal, generatingSignal
+  let listState = { version: 1, mode: 'lists', active: 'default', draftList: 'default', fileLayout: 'flat',
+    lists: [{ id: 'default', name: '默认', draft: '', expanded: true }],
+    assignments: Object.fromEntries(STATUS.files.map((file) => [file.path, 'default'])), selected: STATUS.files.map((file) => file.path), chunks: {} }
+  tree = await renderApp(healthyHandlers({
+    changelists: () => listState,
+    updateChangelist: (payload) => {
+      listState = { ...listState, version: listState.version + 1,
+        lists: listState.lists.map((list) => payload.action === 'draft' && list.id === payload.id ? { ...list, draft: payload.text } : list) }
+      return listState
+    },
+    'ai.prepareCommitMessage': (_payload, signal) => new Promise((resolve, reject) => {
+      preparingSignal = signal; releaseContext = resolve
+      signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true })
+    }),
+    'ai.commitMessage': (_payload, signal) => new Promise((resolve, reject) => {
+      generatingSignal = signal; releaseModel = resolve
+      signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true })
+    }),
+  }))
+  const props = { connection: mounted.rpc, t }
+  const aiButton = () => findAll(tree, 'button').find((node) => String(node.props.className).includes('dshgit-commit-ai'))
+  const commitButton = () => findAll(tree, 'button').find((node) => String(node.props.className).includes('dshgit-commit-primary'))
+  const scopeChecks = () => findAll(tree, 'input').filter((node) => String(node.props.className).includes('dshgit-cl-checkbox'))
+  const previousStage = findAll(tree, 'button').find((node) => ['stage', 'unstage'].includes(node.props['data-file-action']) && !node.props.disabled)
+  const previousSelection = scopeChecks().find((node) => !node.props.disabled)
+  aiButton().props.onClick()
+  tree = await flush(GitApp, props)
+  check('AI preparation keeps the composer compact', !walk(tree).some((node) => node.props?.['data-ai-phase']) && preparingSignal && !preparingSignal.aborted)
+  check('the running AI button remains enabled for cancellation', aiButton().props['aria-label'] === t('ai.cancelGeneration') && !aiButton().props.disabled)
+  check('AI preparation blocks commit, file selection and staging', commitButton().props.disabled && scopeChecks().length > 0 && scopeChecks().every((node) => node.props.disabled) &&
+    findAll(tree, 'button').filter((node) => ['stage', 'unstage', 'discard'].includes(node.props['data-file-action'])).every((node) => node.props.disabled))
+  const writesBefore = mounted.rpc.calls.filter((call) => call.method.startsWith('write.') || call.method === 'updateChangelist' && call.payload.action !== 'draft').length
+  previousStage?.props.onClick({ stopPropagation() {} })
+  previousSelection?.props.onChange({ currentTarget: { checked: !previousSelection.props.checked } })
+  findAll(tree, 'textarea')[0].props.onKeyDown({ key: 'Enter', ctrlKey: true, preventDefault() {}, stopPropagation() {} })
+  tree = await flush(GitApp, props)
+  check('stale handlers and the commit shortcut cannot mutate a generating scope', previousStage && previousSelection && writesBefore ===
+    mounted.rpc.calls.filter((call) => call.method.startsWith('write.') || call.method === 'updateChangelist' && call.payload.action !== 'draft').length)
+  aiButton().props.onClick()
+  tree = await flush(GitApp, props)
+  check('cancelling preparation aborts its RPC and skips the model', preparingSignal.aborted && !mounted.rpc.calls.some((call) => call.method === 'ai.commitMessage'))
+  check('cancelling generation restores commit and selection controls', !commitButton().props.disabled && scopeChecks().some((node) => !node.props.disabled))
+  aiButton().props.onClick()
+  tree = await flush(GitApp, props)
+  releaseContext({ available: true, empty: false, id: 'prepared-scope', prepareMs: 120, cacheHit: false })
+  tree = await flush(GitApp, props)
+  check('AI model generation starts without extra status text', !walk(tree).some((node) => node.props?.['data-ai-phase']) &&
+    mounted.rpc.calls.some((call) => call.method === 'ai.commitMessage' && call.payload.contextId === 'prepared-scope'))
+  check('the model phase keeps scope operations blocked and cancellation available', commitButton().props.disabled && scopeChecks().every((node) => node.props.disabled) && !aiButton().props.disabled)
+  aiButton().props.onClick()
+  tree = await flush(GitApp, props)
+  releaseModel({ available: true, message: 'stale cancelled message' })
+  tree = await flush(GitApp, props)
+  check('cancelling generation aborts the model RPC and preserves the draft', generatingSignal.aborted &&
+    findAll(tree, 'textarea')[0]?.props.value !== 'stale cancelled message')
+  aiButton().props.onClick()
+  tree = await flush(GitApp, props)
+  releaseContext({ available: true, empty: false, id: 'prepared-scope-2', prepareMs: 120, cacheHit: true })
+  tree = await flush(GitApp, props)
+  releaseModel({ available: true, empty: false, message: 'fix: 新请求完成', timings: { prepareMs: 80, generateMs: 1500 } })
+  tree = await flush(GitApp, props)
+  check('a new generation succeeds after cancellation', findAll(tree, 'textarea')[0]?.props.value === 'fix: 新请求完成')
+  check('successful generation releases commit and selection controls', !commitButton().props.disabled && scopeChecks().some((node) => !node.props.disabled))
+  check('completed generation does not display preparation or model timings', !hasText(tree, '差异准备') && !hasText(tree, 'Changes prepared in'))
+  aiButton().props.onClick()
+  tree = await flush(GitApp, props)
+  const signal = preparingSignal
+  tree = await selectModule(tree, 'history')
+  // This harness retains disposers instead of automatically unmounting nodes.
+  runCleanups()
+  check('disposing the composer aborts its pending AI request', signal.aborted)
 }
 
 /* ------------------------------------------------------------------ *
