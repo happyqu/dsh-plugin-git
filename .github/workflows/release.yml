@@ -102,6 +102,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: release-package
@@ -115,7 +119,7 @@ jobs:
         run: |
           cd build/release
           sha256sum --check SHA256SUMS.txt
-          args=(--verify-tag --generate-notes --title "$RELEASE_TAG")
+          args=(--verify-tag --notes-from-tag --title "$RELEASE_TAG")
           if [[ "$PRERELEASE" == 'true' ]]; then
             args+=(--prerelease --latest=false)
           fi

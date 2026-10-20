@@ -34,8 +34,15 @@ try {
   run('git', ['remote', 'get-url', 'origin'], true)
   // Check remote access and branch divergence before creating a version commit.
   run('git', ['push', '--dry-run', 'origin', 'HEAD'])
+  const previous = spawnSync('git', ['describe', '--tags', '--match', 'v[0-9]*', '--abbrev=0', 'HEAD'], {
+    cwd: root, encoding: 'utf8', windowsHide: true,
+  })
+  if (previous.error) throw previous.error
+  const range = previous.status === 0 ? `${previous.stdout.trim()}..HEAD` : 'HEAD'
+  const changes = run('git', ['log', '--format=- %s (%h)', range], true)
+  const message = `v%s\n\n更新内容：\n\n${changes || '- 维护更新。'}`
   console.log(`发布 ${branch} 的 ${bump} 版本…`)
-  run(process.execPath, [process.env.npm_execpath, 'version', bump, '--tag-version-prefix=v', '--git-tag-version=true'])
+  run(process.execPath, [process.env.npm_execpath, 'version', bump, '--tag-version-prefix=v', '--git-tag-version=true', '--message', message])
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
   releaseTag = `v${pkg.version}`
   // Push only this release tag, and require the branch and tag to update together.
