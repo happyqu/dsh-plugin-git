@@ -36,6 +36,10 @@
 - 连接远程 DSH 时，文件操作、Git 和外部编辑器均运行在远程设备上。
 - 更新后若提示功能尚未加载，请重新加载 Git 插件 Host 或重启 DSH；仅刷新页面不会更新 Host。
 
+## 维护者
+
+版本发布与 npm 授权配置见 [发版指南](docs/releasing.md)。
+
 ## 反馈
 
 源码：[GitHub](https://github.com/happyqu/dsh-plugin-git) · 问题反馈：[Issues](https://github.com/happyqu/dsh-plugin-git/issues)

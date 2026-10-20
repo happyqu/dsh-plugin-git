@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      npm-tag: ${{ steps.version.outputs.npm_tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Validate release version
+        id: version
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs'
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
+          const lock = JSON.parse(readFileSync('package-lock.json', 'utf8'))
+          const tag = process.env.GITHUB_REF_NAME
+          if (!/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(tag) || tag !== `v${pkg.version}`) {
+            throw new Error(`Tag ${tag} must match package.json version v${pkg.version}`)
+          }
+          if (lock.version !== pkg.version || lock.packages[''].version !== pkg.version) {
+            throw new Error('package-lock.json version must match package.json; use npm version')
+          }
+          const prerelease = pkg.version.includes('-')
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            `npm_tag=${prerelease ? 'next' : 'latest'}\nprerelease=${prerelease}\n`)
+          NODE
+      - run: npm ci
+      - run: npm test
+      - run: npm run check:commit
+      - name: Build and pack distributable
+        run: |
+          mkdir -p build/release
+          npm pack --pack-destination build/release
+          cd build/release
+          sha256sum *.tgz > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: build/release/
+          if-no-files-found: error
+
+  npm:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: npm-publish
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package
+          path: build/release
+      - name: Publish the built package
+        env:
+          NPM_DIST_TAG: ${{ needs.build.outputs.npm-tag }}
+        run: |
+          cd build/release
+          sha256sum --check SHA256SUMS.txt
+          if [[ "$NPM_DIST_TAG" == 'latest' ]]; then
+            # Keep latest implicit: npm rejects versions below the highest stable
+            # version. Explicit --tag latest would bypass that protection.
+            npm publish ./*.tgz --access public --provenance
+          else
+            npm publish ./*.tgz --access public --provenance --tag "$NPM_DIST_TAG"
+          fi
+
+  github:
+    name: Publish GitHub Release
+    needs: [build, npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package
+          path: build/release
+      - name: Create release with compiled package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          cd build/release
+          sha256sum --check SHA256SUMS.txt
+          args=(--verify-tag --generate-notes --title "$RELEASE_TAG")
+          if [[ "$PRERELEASE" == 'true' ]]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" ./*.tgz SHA256SUMS.txt "${args[@]}"
