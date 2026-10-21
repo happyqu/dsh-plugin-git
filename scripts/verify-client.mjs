@@ -1753,6 +1753,49 @@ console.log('\n--- simplified workbench branch layout ---')
   check('branches inside a directory also sort by name', JSON.stringify(names) === JSON.stringify(['refs/heads/feature/apple', 'refs/heads/feature/zebra']), JSON.stringify(names))
 }
 
+console.log('\n--- branch picker pushes tracked branches directly ---')
+for (const entry of ['quick action', 'context menu']) {
+  for (const scenario of [
+    { name: 'main', upstream: 'refs/remotes/origin/main', remote: 'origin', target: 'main' },
+    { name: 'feature/新功能', upstream: 'refs/remotes/team/origin/review/feature', remote: 'team/origin', target: 'review/feature' },
+    { name: 'feature/新功能', upstream: null },
+  ]) {
+    const branches = REFS.branches.map(branch => branch.name === scenario.name
+      ? { ...branch, upstream: null, upstreamRef: scenario.upstream } : branch)
+    let header = await renderChips(healthyHandlers({
+      refs: () => ({ ...REFS, branches }),
+      remotes: () => scenario.remote === 'team/origin' ? [...REMOTES, { name: 'team' }, { name: 'team/origin' }] : REMOTES,
+      'write.push': () => ({ ok: true, message: 'pushed' }),
+    }))
+    const rootProps = { connection: mounted.rpc, t: mounted.t }
+    findAll(header, 'button').find(node => node.props['data-chip'] === 'branch').props.onClick({
+      currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) },
+    })
+    header = await flush(GitApp, rootProps)
+    const row = walk(header).find(node => node.props?.['data-picker-branch'] === 'refs/heads/' + scenario.name)
+    if (scenario.name !== 'main') {
+      const actions = findAll(row, 'button').filter(node => node.props['data-branch-action'])
+      check('merge is the last branch-row shortcut', actions.at(-1)?.props['data-branch-action'] === 'merge')
+    }
+    if (entry === 'quick action') findAll(row, 'button').find(node => node.props['data-branch-action'] === 'push').props.onClick({ preventDefault() {}, stopPropagation() {} })
+    else {
+      row.props.onContextMenu({ clientX: 100, clientY: 120, preventDefault() {}, stopPropagation() {} })
+      header = await flush(GitApp, rootProps)
+      const menu = walk(header).find(node => node.props?.className === 'dshgit-contextmenu')
+      findAll(menu, 'button').find(node => textOf(node).includes(t('wb.push'))).props.onClick()
+    }
+    header = await flush(GitApp, rootProps)
+    const push = mounted.rpc.calls.find(call => call.method === 'write.push')
+    if (scenario.upstream) {
+      check(`${entry} directly pushes ${scenario.name} to its configured upstream`, push?.payload.remote === scenario.remote &&
+        push.payload.sourceBranch === scenario.name && push.payload.targetBranch === scenario.target && !push.payload.forceWithLease && !push.payload.setUpstream)
+      check(`${entry} tracked push opens no configuration dialog`, !walk(header).some(node => node.props?.role === 'dialog' && node.props?.['aria-label'] === t('wb.push')))
+    } else {
+      check(`${entry} untracked branch still asks for its push target`, !push && walk(header).some(node => node.props?.role === 'dialog' && node.props?.['aria-label'] === t('wb.push')))
+    }
+  }
+}
+
 console.log('\n--- header local checkout confirmation ---')
 for (const entry of ['row', 'quick action', 'context menu']) {
   let header = await renderChips()
@@ -2771,6 +2814,7 @@ console.log('\n--- blank-session Git follows the selected workspace ---')
     refs: () => ({ ...REFS, branches: REFS.branches.filter((branch) => branch.ref.startsWith('refs/heads/')), remotes: Array.from({ length: 120 }, (_, index) => ({ name: 'origin/feature/' + index, ref: 'refs/remotes/origin/feature/' + index, sha: 'b'.repeat(40) })) }),
     repos: (payload) => ({ gitPath: 'git', repos: payload.path === empty && !initialized ? [] : [{ root: payload.path }], directory: payload.path, canInitialize: payload.path === empty }),
     initRepository: () => { initialized = true; return { root: empty } },
+    'write.push': () => ({ ok: true, message: 'pushed' }),
   }))
   const context = createClientContext({ connection: rpc })
   const workspaceClient = loadClientModule(source)
@@ -2817,6 +2861,15 @@ console.log('\n--- blank-session Git follows the selected workspace ---')
   view = await flush(WorkspaceHarness, props)
   check('search reaches branches beyond the expanded rows', remoteRows().length === 1 && remoteRows()[0].props['data-picker-branch'] === 'refs/remotes/origin/feature/119')
   findAll(view, 'input').find((node) => node.props.className === 'dshgit-pickerinput').props.onChange({ currentTarget: { value: '' } })
+  view = await flush(WorkspaceHarness, props)
+  const trackedMain = walk(view).find(node => node.props?.['data-picker-branch'] === 'refs/heads/main')
+  findAll(trackedMain, 'button').find(node => node.props['data-branch-action'] === 'push').props.onClick({ preventDefault() {}, stopPropagation() {} })
+  view = await flush(WorkspaceHarness, props)
+  const blankPush = rpc.calls.find(call => call.method === 'write.push')
+  check('blank-session branch push uses the selected workspace and upstream', blankPush?.payload.root === selected &&
+    blankPush.payload.remote === 'origin' && blankPush.payload.sourceBranch === 'main' && blankPush.payload.targetBranch === 'main')
+  check('blank-session tracked push opens no push configuration dialog', !walk(view).some(node => node.props?.role === 'dialog' && node.props?.['aria-label'] === t('wb.push')))
+  findAll(view, 'button').find(node => node.props['data-chip'] === 'branch').props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) } })
   view = await flush(WorkspaceHarness, props)
   const row = walk(view).find((node) => node.props?.['data-picker-branch'] === 'refs/heads/feature/新功能')
   findAll(row, 'button').find((node) => node.props['data-ref'] === 'feature/新功能').props.onClick()
