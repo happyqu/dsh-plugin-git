@@ -12,6 +12,9 @@
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { readFileSync } from 'node:fs'
+import { findHeroWorkspaceRow, insertHeroActions, syncHeroBranchFont } from '../lib/client/core/hero-placement.js'
+import { popoverPosition } from '../lib/client/ui/popover-position.js'
+import { observeWorkspaceNavigation, getWorkspaceNavigation, acknowledgeWorkspaceNavigation } from '../lib/client/core/workspace-navigation.js'
 
 import {
   loadClientModule,
@@ -265,12 +268,14 @@ function healthyHandlers(overrides = {}) {
     'write.createBranch': () => ({ ok: true, code: 0, message: '已新建分支', stdout: '' }),
     'write.discardAll': () => ({ ok: true, code: 0, message: '已丢弃全部', stdout: '' }),
     'write.clean': () => ({ ok: true, code: 0, message: '已清理', stdout: '' }),
+    'ai.prepareCommitMessage': () => ({ available: true, id: 'context' }),
     'ai.commitMessage': () => ({ available: true, message: 'feat: 新增中文说明文档', empty: false }),
     'ai.explainCommit': () => ({ available: true, text: '这次提交把文件重命名了。' }),
     'ai.summarizeDiff': () => ({ available: true, text: '总体：小改动。' }),
     'write.stage': () => ({ ok: true, code: 0, message: '已暂存', stdout: '' }),
     'write.unstage': () => ({ ok: true, code: 0, message: '已取消暂存', stdout: '' }),
     'write.commit': () => ({ ok: true, code: 0, message: '提交成功', stdout: '' }),
+    'write.discardPaths': () => ({ ok: true, message: '已丢弃' }),
     'write.discardPath': () => ({ ok: true, code: 0, message: '已丢弃', stdout: '' }),
     'write.checkout': () => ({ ok: true, code: 0, message: '已切换', stdout: '' }),
     'write.stashApply': () => ({ ok: true, code: 0, message: '已应用', stdout: '' }),
@@ -570,8 +575,8 @@ check('the button and the window use distinct ids',
 check('the button label is localized through a thunk',
   typeof footerAction[0]?.declaration.label === 'function',
   typeof footerAction[0]?.declaration.label)
-check('the three registrations target distinct slots',
-  new Set(client.registrations.map((entry) => entry.declaration.name)).size === 3,
+check('the four registrations target distinct slots',
+  new Set(client.registrations.map((entry) => entry.declaration.name)).size === 4,
   client.registrations.map((entry) => entry.declaration.name).join(', '))
 
 /* ------------------------------------------------------------------ *
@@ -1336,7 +1341,7 @@ console.log('\n--- the preview degrades to plain text without the platform highl
   const bareStub = createRpcStub(healthyHandlers())
   const bareContext = createClientContext({ connection: bareStub })
   bare.apply(bareContext.ctx)
-  check('it still registers its slots', bareContext.registrations.length === 3,
+  check('it still registers its slots', bareContext.registrations.length === 4,
     String(bareContext.registrations.length))
 }
 
@@ -1880,7 +1885,7 @@ console.log('\n--- discard asks before writing, and names the file ---')
   decline.props.onClick()
   tree = await flush(GitApp, { connection: mounted.rpc, t })
   check('declining performs no write at all',
-    !mounted.rpc.calls.some((call) => call.method === 'write.discardPath'),
+    !mounted.rpc.calls.some((call) => call.method === 'write.discardPaths'),
     mounted.rpc.calls.map((c) => c.method).join(','))
 
   // Accepting must write, and must carry the confirmation token.
@@ -1890,12 +1895,12 @@ console.log('\n--- discard asks before writing, and names the file ---')
   const accept = findAll(tree, 'button').find((node) => textOf(node) === t('action.apply'))
   accept.props.onClick()
   tree = await flush(GitApp, { connection: mounted.rpc, t })
-  const writeCall = mounted.rpc.calls.find((call) => call.method === 'write.discardPath')
+  const writeCall = mounted.rpc.calls.find((call) => call.method === 'write.discardPaths')
   check('accepting performs the write', writeCall !== undefined,
     mounted.rpc.calls.map((c) => c.method).join(','))
   check('the write carried an explicit confirmation', writeCall?.payload?.confirm === true,
     JSON.stringify(writeCall?.payload))
-  check('the write carried the untracked flag correctly', writeCall?.payload?.untracked === false,
+  check('the batch write carries an empty untracked path list', Array.isArray(writeCall?.payload?.untrackedPaths) && writeCall.payload.untrackedPaths.length === 0,
     JSON.stringify(writeCall?.payload))
 }
 
@@ -2679,6 +2684,236 @@ console.log('\n--- tag clicks directly create a branch without detached checkout
   check('detached header identifies annotated tag and detached state', hasText(chip, t('wb.detachedState', { name: 'v0.1.0' })))
 }
 
+
+console.log('\n--- blank-session Git placement after the mode picker ---')
+{
+  const row = {}
+  const preset = { parentElement: row }
+  const seat = { querySelector: (selector) => selector === '[data-slot="conversation.hero.agentPreset"]' ? preset : null }
+  const toolbar = { querySelector: () => null, parentElement: seat }
+  check('Hero placement finds the mode picker row within its own composer', findHeroWorkspaceRow({ parentElement: toolbar }) === row)
+  const boundary = { querySelector: () => null, hasAttribute: (name) => name === 'data-phase', parentElement: seat }
+  check('Hero placement never borrows another conversation mode picker', findHeroWorkspaceRow({ parentElement: boundary }) === null)
+  check('Hosts without the Hero anchor retain the toolbar fallback', findHeroWorkspaceRow({ parentElement: { querySelector: () => null } }) === null)
+  const options = { name: 'host-options-with-auto-margin' }
+  const mode = { nextSibling: options }
+  const git = { name: 'git-controls' }
+  const children = [mode, options]
+  insertHeroActions({ querySelector: () => mode, insertBefore: (node, before) => children.splice(before ? children.indexOf(before) : children.length, 0, node) }, git)
+  check('Git is inserted immediately after mode and before the Host auto-margin options', children[0] === mode && children[1] === git && children[2] === options)
+  let appended = false
+  insertHeroActions({ querySelector: () => ({ nextSibling: null }), insertBefore: (node, before) => { appended = node === git && before === null } }, git)
+  check('older Hosts without trailing options still place Git after mode', appended)
+  const label = { closest: () => null, childNodes: [{ nodeType: 3, textContent: '标准模式' }] }
+  const button = { closest: () => null, childNodes: [], querySelectorAll: () => [label] }
+  const presetSeat = { querySelector: () => button }
+  const fontRow = { querySelector: () => presetSeat }
+  const sizes = new Map()
+  const container = { style: { getPropertyValue: key => sizes.get(key), setProperty: (key, value) => sizes.set(key, value) } }
+  let labelSize = '14px'
+  const computed = element => ({ fontSize: element === label ? labelSize : '20px',
+    fontFamily: 'Arial', fontWeight: '600', lineHeight: '22px', letterSpacing: 'normal' })
+  syncHeroBranchFont(fontRow, container, computed)
+  check('branch matches the mode label font instead of the larger wrapper font', sizes.get('--dshgit-hero-font-size') === '14px')
+  labelSize = '16px'
+  syncHeroBranchFont(fontRow, container, computed)
+  check('branch font follows changes to the mode label size', sizes.get('--dshgit-hero-font-size') === '16px')
+  check('branch also follows mode label family, weight and line height',
+    sizes.get('--dshgit-hero-font-family') === 'Arial' && sizes.get('--dshgit-hero-font-weight') === '600' && sizes.get('--dshgit-hero-line-height') === '22px')
+}
+
+console.log('\n--- bounded popover placement ---')
+{
+  const anchor = { left: 500, right: 640, top: 100, bottom: 130 }
+  const position = popoverPosition(anchor, { width: 400, maxHeight: 400, align: 'start' }, { width: 1200, height: 800 })
+  check('Hero picker aligns with the branch button left edge and stays compact', position.left === '500px' && position.top === '136px' && position.width === '400px' && position.maxHeight === '400px')
+  const above = popoverPosition({ left: 500, right: 640, top: 650, bottom: 680 }, { width: 400, maxHeight: 400, align: 'start' }, { width: 1200, height: 800 })
+  check('picker flips above a low trigger without a gap for short content', above.top === undefined && above.bottom === '156px' && above.maxHeight === '400px')
+  const narrow = popoverPosition(anchor, { width: 400, maxHeight: 400, align: 'start' }, { width: 320, height: 300 })
+  check('narrow viewport clamps width and list height inside the screen', narrow.left === '8px' && narrow.width === '304px' && narrow.maxHeight === '156px')
+  const header = popoverPosition(anchor, { width: 460, maxHeight: 400, align: 'end' }, { width: 1200, height: 800 })
+  check('resident header picker retains alignment with the trigger right edge', header.left === '180px')
+}
+
+console.log('\n--- workspace navigation lifetime and supersession ---')
+{
+  const attempts = []
+  const service = { openWorkspace(workspaceId, beforeOpen) {
+    check('workspace navigation preserves the service receiver', this === service)
+    return new Promise((resolve, reject) => attempts.push({ resolve, reject, beforeOpen }))
+  } }
+  const original = service.openWorkspace
+  const dispose = observeWorkspaceNavigation(service)
+  const first = service.openWorkspace('first').catch(() => {})
+  const second = service.openWorkspace('second')
+  attempts[0].reject(new Error('older failed')); await first
+  check('an older navigation failure cannot unlock the latest request', getWorkspaceNavigation()?.workspaceId === 'second')
+  attempts[1].beforeOpen('second-session'); attempts[1].resolve('done')
+  check('workspace navigation preserves its return value', await second === 'done')
+  acknowledgeWorkspaceNavigation('first-session')
+  check('an unrelated session cannot acknowledge workspace navigation', getWorkspaceNavigation()?.sessionId === 'second-session')
+  acknowledgeWorkspaceNavigation('second-session')
+  check('matching session binding releases the navigation lock', getWorkspaceNavigation() === null)
+  const third = service.openWorkspace('third')
+  dispose()
+  check('plugin disposal restores the public method and clears the lock', service.openWorkspace === original && getWorkspaceNavigation() === null)
+  attempts[2].resolve(); await third
+  check('a disposed observer cannot restore stale pending state', getWorkspaceNavigation() === null)
+}
+
+console.log('\n--- blank-session Git follows the selected workspace ---')
+{
+  const selected = 'D:/demo/selected-workspace'
+  const other = 'D:/demo/unrelated-workspace'
+  const empty = 'D:/demo/not-yet-a-repo'
+  let initialized = false
+  const rpc = createRpcStub(healthyHandlers({
+    refs: () => ({ ...REFS, branches: REFS.branches.filter((branch) => branch.ref.startsWith('refs/heads/')), remotes: Array.from({ length: 120 }, (_, index) => ({ name: 'origin/feature/' + index, ref: 'refs/remotes/origin/feature/' + index, sha: 'b'.repeat(40) })) }),
+    repos: (payload) => ({ gitPath: 'git', repos: payload.path === empty && !initialized ? [] : [{ root: payload.path }], directory: payload.path, canInitialize: payload.path === empty }),
+    initRepository: () => { initialized = true; return { root: empty } },
+  }))
+  const context = createClientContext({ connection: rpc })
+  const workspaceClient = loadClientModule(source)
+  const navigations = []
+  context.ctx.uiWorkspace = { openWorkspace: (workspaceId, beforeOpen) => new Promise((resolve, reject) => { navigations.push({ workspaceId, beforeOpen, resolve, reject }) }) }
+  workspaceClient.apply(context.ctx)
+  const Blank = context.registrations.find((entry) => entry.declaration.name === 'conversation.input.left').Component
+  const Header = context.registrations.find((entry) => entry.declaration.name === 'conversation.session.header.utilities').Component
+  const Window = context.registrations.find((entry) => entry.declaration.id === 'git-window').Component
+  function WorkspaceHarness(props) {
+    const controls = {
+      sessionId: props.sessionId || 'new-session', t,
+      useSession: (selector) => selector({ blank: props.blank }),
+      useWorkspaces: (selector) => selector({ items: [
+        { workspaceId: 'other', path: other, sessionIds: ['other-session'] },
+        { workspaceId: 'selected', path: props.directory, sessionIds: [props.sessionId || 'new-session'] },
+      ] }),
+      useSessions: (selector) => selector({ byId: { 'new-session': { cwd: other } } }),
+    }
+    return [h(props.blank ? Blank : Header, controls), h(Window, { t })]
+  }
+  let props = { blank: true, directory: selected }
+  mount(WorkspaceHarness, props)
+  let view = await flush(WorkspaceHarness, props)
+  check('blank composer offers a branch picker before any message', findAll(view, 'button').some((node) => node.props['data-chip'] === 'branch'))
+  check('blank composer has no separate Git workbench icon', !findAll(view, 'button').some((node) => node.props['aria-label'] === t('window.open')))
+  check('workspace mapping beats both first workspace and stale session cwd', rpc.calls.filter((call) => call.method === 'repos').every((call) => call.payload.path === selected && call.payload.sessionId === 'new-session'), JSON.stringify(rpc.calls.filter((call) => call.method === 'repos')))
+  findAll(view, 'button').find((node) => node.props['data-chip'] === 'branch').props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) } })
+  view = await flush(WorkspaceHarness, props)
+  const remoteRows = () => walk(view).filter((node) => String(node.props?.['data-picker-branch'] || '').startsWith('refs/remotes/'))
+  const mainRow = walk(view).find((node) => node.props?.['data-picker-branch'] === 'refs/heads/main')
+  const trackingCounts = walk(mainRow).find((node) => node.props?.className === 'dshgit-picker-tracking')
+  check('branch picker shows ahead and behind counts beside the current branch', hasText(trackingCounts, '↑2') && hasText(trackingCounts, '↓1'))
+  const syncedRow = walk(view).find((node) => node.props?.['data-picker-branch'] === 'refs/heads/feature/新功能')
+  check('branches with zero divergence have no count badge', !walk(syncedRow).some((node) => node.props?.className === 'dshgit-picker-tracking'))
+  check('many remote branches start collapsed in the Hero picker', remoteRows().length === 0 && findAll(view, 'button').some((node) => node.props['data-picker-toggle'] === 'remotes' && node.props['aria-expanded'] === false))
+  findAll(view, 'button').find((node) => node.props['data-picker-toggle'] === 'remotes').props.onClick()
+  view = await flush(WorkspaceHarness, props)
+  check('expanding remote branches initially renders only five rows', remoteRows().length === 5)
+  findAll(view, 'button').find((node) => node.props['data-picker-more'] === 'remotes').props.onClick()
+  view = await flush(WorkspaceHarness, props)
+  check('show more reveals remote branches in small batches', remoteRows().length === 10)
+  findAll(view, 'input').find((node) => node.props.className === 'dshgit-pickerinput').props.onChange({ currentTarget: { value: 'origin/feature/119' } })
+  view = await flush(WorkspaceHarness, props)
+  check('search reaches branches beyond the expanded rows', remoteRows().length === 1 && remoteRows()[0].props['data-picker-branch'] === 'refs/remotes/origin/feature/119')
+  findAll(view, 'input').find((node) => node.props.className === 'dshgit-pickerinput').props.onChange({ currentTarget: { value: '' } })
+  view = await flush(WorkspaceHarness, props)
+  const row = walk(view).find((node) => node.props?.['data-picker-branch'] === 'refs/heads/feature/新功能')
+  findAll(row, 'button').find((node) => node.props['data-ref'] === 'feature/新功能').props.onClick()
+  view = await flush(WorkspaceHarness, props)
+  const dialog = walk(view).find((node) => node.props?.role === 'alertdialog')
+  findAll(dialog, 'button').find((node) => textOf(node) === t('action.switchBranch')).props.onClick()
+  view = await flush(WorkspaceHarness, props)
+  const checkout = rpc.calls.find((call) => call.method === 'write.checkout')
+  check('blank-session checkout writes to the selected workspace', checkout?.payload.root === selected && checkout.payload.ref === 'refs/heads/feature/新功能' && checkout.payload.confirm === true)
+  const notice = walk(view).find((node) => node.props?.className === 'dshgit-notice' && node.props?.['data-placement'] === 'bottom')
+  check('blank-session outcomes appear at the viewport bottom center', notice?.props.style.bottom === '24px' && notice.props.style.left === '50%' && notice.props.style.top === 'auto')
+  findAll(view, 'button').find((node) => node.props['data-chip'] === 'branch').props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) } })
+  view = await flush(WorkspaceHarness, props)
+  findAll(view, 'button').find((node) => node.props['data-picker-open-git']).props.onClick()
+  view = await flush(WorkspaceHarness, props)
+  check('branch popup opens the full Git window and closes itself', walk(view).some((node) => node.props?.['data-mode'] === 'full') && !walk(view).some((node) => node.props?.['data-popover'] === 'branch'))
+  check('blank-session workbench discovers the same explicit directory', rpc.calls.filter((call) => call.method === 'repos').every((call) => call.payload.path === selected))
+  props = { blank: true, directory: empty }
+  view = await flush(WorkspaceHarness, props)
+  check('changing workspace clears the old branch and offers initialization', findAll(view, 'button').some((node) => node.props['data-chip'] === 'init'))
+  findAll(view, 'button').find((node) => node.props['data-chip'] === 'init').props.onClick()
+  view = await flush(WorkspaceHarness, props)
+  check('initialization explicitly targets the new workspace', rpc.calls.some((call) => call.method === 'initRepository' && call.payload.directory === empty))
+  check('initialized workspace gains a branch picker', findAll(view, 'button').some((node) => node.props['data-chip'] === 'branch'))
+  const previousRun = context.registrations.find((entry) => entry.declaration.name === 'settings.section').Component({ t }).props.run
+  const switching = context.ctx.uiWorkspace.openWorkspace('selected')
+  view = await flush(WorkspaceHarness, props)
+  check('slow workspace navigation disables the old Git controls', findAll(view, 'button').some((node) => node.props['data-workspace-pending'] && node.props.disabled) && !findAll(view, 'button').some((node) => node.props['data-chip'] === 'branch'))
+  check('workspace navigation makes the existing workbench inert', walk(view).some((node) => node.props?.['data-mode'] === 'full' && node.props.inert === true))
+  const writesBefore = rpc.calls.filter((call) => call.method === 'write.checkout').length
+  const blockedWrite = await previousRun('write.checkout', { root: empty, ref: 'refs/heads/main', confirm: true }).then(() => false, () => true)
+  check('even a retained old dialog callback cannot send a write during navigation', blockedWrite && rpc.calls.filter((call) => call.method === 'write.checkout').length === writesBefore)
+  navigations[0].beforeOpen('next-session'); navigations[0].resolve()
+  await switching
+  view = await flush(WorkspaceHarness, props)
+  check('navigation completion still waits for the new session binding', findAll(view, 'button').some((node) => node.props['data-workspace-pending']))
+  props = { blank: true, directory: selected, sessionId: 'next-session' }
+  view = await flush(WorkspaceHarness, props)
+  check('the matching new session restores Git against its directory', !findAll(view, 'button').some((node) => node.props['data-workspace-pending']) && rpc.calls.filter((call) => call.method === 'repos').at(-1)?.payload.path === selected)
+  const failing = context.ctx.uiWorkspace.openWorkspace('other').catch((error) => error.message)
+  view = await flush(WorkspaceHarness, props)
+  navigations[1].reject(new Error('navigation failed'))
+  check('navigation errors preserve the Host error', await failing === 'navigation failed')
+  view = await flush(WorkspaceHarness, props)
+  check('failed navigation restores the original workspace controls', !findAll(view, 'button').some((node) => node.props['data-workspace-pending']) && findAll(view, 'button').some((node) => node.props['data-chip'] === 'branch'))
+  props = { blank: false, directory: selected }
+  view = await flush(WorkspaceHarness, props)
+  check('after the first message the header continues using the workspace', rpc.calls.filter((call) => call.method === 'repos').at(-1)?.payload.path === selected)
+  function BlankOnly(props) { return h(Blank, { sessionId: 'new-session', t, useSession: (select) => select({ blank: props.blank }), useWorkspaces: (select) => select({ items: [] }), useSessions: (select) => select({ byId: {} }) }) }
+  mount(BlankOnly, { blank: true })
+  view = await flush(BlankOnly, { blank: true })
+  check('without a workspace no repository is guessed', findAll(view, 'button').length === 0)
+}
+
+console.log('\n--- LFS reconnects after repeated status failures ---')
+{
+  runCleanups()
+  // Expose the bundled panel and shorten its timers in this fixture only.
+  const fixture = source.replace('factory: (require) => {',
+    'factory: (require) => { var setTimeout = (callback, delay) => globalThis.setTimeout(callback, Math.min(delay, 1));')
+    .replace('    return module.exports', '    module.exports.LfsPanel = LfsPanel;\n    return module.exports')
+  const { LfsPanel } = loadClientModule(fixture)
+  const running = { id: 'lfs-reconnect', root: ROOT, method: 'write.lfsTransfer', state: 'running' }
+  let reads = 0, connected = false, completed = false
+  const props = {
+    repo: { root: ROOT }, t,
+    onToast: () => { completed = true },
+    run: async (method, body) => {
+      if (method === 'operationStatus') {
+        if (!body.id) return running
+        reads++
+        if (!connected) throw new Error('temporary disconnect')
+        return { ...running, state: 'complete', result: { ok: true, value: { message: 'download complete' } } }
+      }
+      if (method === 'lfsStatus') return { installed: true, initialized: true, version: 'test' }
+      if (method === 'lfsDetails') return { rules: '', backups: [] }
+      if (method === 'remotes' || method === 'lfsBranches') return []
+      throw new Error('Unexpected RPC: ' + method)
+    },
+  }
+  mount(LfsPanel, props)
+  let tree = await flush(LfsPanel, props)
+  for (let attempt = 0; reads < 6 && attempt < 50; attempt++) await new Promise(resolve => setTimeout(resolve, 2))
+  tree = await flush(LfsPanel, props)
+  check('LFS keeps retrying beyond five failed status requests', reads >= 6, String(reads))
+  check('an uncertain LFS task keeps controls disabled',
+    findAll(tree, 'button').find(node => textOf(node) === t('action.refresh'))?.props.disabled === true)
+  check('an uncertain LFS task retains its cancel control',
+    findAll(tree, 'button').some(node => node.props.className === 'dshgit-progress-cancel'))
+  connected = true
+  for (let attempt = 0; !completed && attempt < 50; attempt++) await new Promise(resolve => setTimeout(resolve, 2))
+  tree = await flush(LfsPanel, props)
+  check('LFS receives the original job result after reconnecting', completed)
+  check('LFS unlocks controls after confirmed completion',
+    findAll(tree, 'button').find(node => textOf(node) === t('action.refresh'))?.props.disabled === false)
+  runCleanups()
+}
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 if (failures > 0) {

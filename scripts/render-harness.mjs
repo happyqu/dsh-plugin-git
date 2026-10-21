@@ -162,6 +162,16 @@ function useMemo(compute, deps) {
 
 /** React-alike namespace handed to the plugin factory. */
 export const React = {
+  useSyncExternalStore(subscribe, getSnapshot) {
+    const [, setSnapshot] = useState(getSnapshot)
+    useEffect(() => {
+      const update = () => setSnapshot(getSnapshot())
+      const unsubscribe = subscribe(update)
+      update()
+      return unsubscribe
+    }, [subscribe, getSnapshot])
+    return getSnapshot()
+  },
   createElement: (type, props, ...children) => {
     const merged = { ...(props ?? {}) }
     // Real React leaves `props.children` UNDEFINED when no child argument was
@@ -237,30 +247,31 @@ function normalizeChildren(children) {
  * @param path - the path prefix for this node.
  * @returns a frozen-ish plain tree of `{ type, props, children }`.
  */
-function renderNode(node, path) {
+function renderNode(node, path, scope = '') {
   if (node === null || node === undefined || node === false || node === true) return null
   if (typeof node === 'string' || typeof node === 'number') return { $$kind: 'text', text: String(node) }
   if (Array.isArray(node)) {
-    return node.map((child, index) => renderNode(child, `${path}.${index}`)).filter((child) => child !== null)
+    return node.map((child, index) => renderNode(child, `${path}.${index}`, scope)).filter((child) => child !== null)
   }
   if (node.$$kind !== 'element') return null
 
   const { type, props } = node
   const childPath = `${path}>${typeof type === 'string' ? type : typeName(type)}`
   if (type === React.Fragment) {
-    return { $$kind: 'fragment', children: renderChildren(props.children, childPath) }
+    return { $$kind: 'fragment', children: renderChildren(props.children, childPath, scope) }
   }
   if (typeof type === 'function') {
     // Component identity is POSITION-INDEPENDENT: name plus, when present, the
-    // React key. An index-based path looks fine until a list reorders or an
+    // React key, including keyed ancestors so replacing a parent resets its children.
+    // An index-based path looks fine until a list reorders or an
     // element is conditionally omitted — then two different components trade
     // hook slots, and state appears to jump between unrelated parts of the UI.
     // That is a harness bug that reads exactly like a plugin bug, so identity is
     // explicit here.
     const key = elementKey(node)
-    const pathKey = `fn:${typeName(type)}${key === null ? '' : `#${key}`}`
+    const pathKey = `${scope}/fn:${typeName(type)}${key === null ? '' : `#${key}`}`
     const rendered = withFrame(pathKey, type, props)
-    const children = renderChildren([rendered.node], childPath)
+    const children = renderChildren([rendered.node], childPath, key === null ? scope : pathKey)
     // React drains passive effects deepest-first: a child's effect runs before
     // its parent's. Pushing a component's own effects only after its children
     // have rendered is what reproduces that order here. Getting it wrong hides
@@ -278,7 +289,7 @@ function renderNode(node, path) {
     $$kind: 'host',
     type: String(type),
     props: bindRef(props, hostRefs),
-    children: renderChildren(props.children, childPath),
+    children: renderChildren(props.children, childPath, scope),
   }
 }
 
@@ -424,13 +435,13 @@ function elementKey(element) {
 }
 
 /** Render a children array, preserving index-based paths. */
-function renderChildren(children, path) {
+function renderChildren(children, path, scope = '') {
   const out = []
   // `children` is absent for an element created without any, which is the normal
   // case for real React too — treat it as no children rather than throwing.
   if (!Array.isArray(children)) return out
   for (let i = 0; i < children.length; i++) {
-    const rendered = renderNode(children[i], `${path}[${i}]`)
+    const rendered = renderNode(children[i], `${path}[${i}]`, scope)
     if (rendered === null) continue
     if (Array.isArray(rendered)) out.push(...rendered)
     else out.push(rendered)
@@ -877,7 +888,8 @@ export function createClientContext(options = {}) {
  */
 export function createRpcStub(handlers) {
   const calls = []
-  return {
+  const jobs = new Map()
+  const stub = {
     calls,
     rpc: {
       /**
@@ -891,6 +903,16 @@ export function createRpcStub(handlers) {
         calls.push({ channel, endpoint, method: request.method, payload: request.payload, signal })
         const handler = handlers[request.method]
         if (handler === undefined) {
+          // Model the current Host job protocol using this fixture's handlers.
+          if (request.method === 'operationStart') {
+            const payload = request.payload
+            const result = await stub.rpc.call(channel, endpoint, { method: payload.method, payload: payload.parameters }, signal)
+            if (!result.ok) return result
+            const job = { id: 'job-' + jobs.size, root: payload.root, method: payload.method, state: 'complete', result }
+            jobs.set(job.id, job)
+            return { ok: true, value: job }
+          }
+          if (request.method === 'operationStatus') return { ok: true, value: jobs.get(request.payload?.id) || null }
           return { ok: false, error: { code: 'git/unknown-method', message: `no stub for ${request.method}` } }
         }
         try {
@@ -909,4 +931,5 @@ export function createRpcStub(handlers) {
       },
     },
   }
+  return stub
 }
