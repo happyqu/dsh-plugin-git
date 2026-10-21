@@ -1248,17 +1248,17 @@ check('shows the commit composer placeholder',
 // The module switcher is the activity bar, not a horizontal tab row: an icon
 // column cannot be squeezed by the sync controls beside it, which is the whole
 // reason the layout was rebuilt.
-check('renders six activity-bar modules',
-  activityItems(tree).length === 6,
+check('renders seven activity-bar modules',
+  activityItems(tree).length === 7,
   JSON.stringify(activityItems(tree).map((node) => node.props['data-module'])))
-// The activity bar is changes / stashes / history / graph / output / settings.
+// The activity bar is changes / graph / history / stashes / worktrees / output / settings.
 // `compare` is deliberately NOT among them: it is opened from a branch's
 // quick actions in the header (`setWindowState({ tab: 'compare' })`), because a
 // comparison always starts from a branch. `navigation.js` keeps a `compare`
 // fallback only so an old stored tab id still resolves.
 check('the activity bar exposes each module by name',
   activityItems(tree).map((node) => node.props['aria-label']).join(',') ===
-    ['changes', 'stashes', 'history', 'graph', 'output', 'settings'].map((id) => t(`tab.${id}`)).join(','),
+    ['changes', 'graph', 'history', 'stashes', 'worktrees', 'output', 'settings'].map((id) => t(`tab.${id}`)).join(','),
   JSON.stringify(activityItems(tree).map((node) => node.props['aria-label'])))
 check('exactly one activity item is marked active',
   activityItems(tree).filter((node) => node.props['aria-pressed'] === true).length === 1)
@@ -2170,8 +2170,8 @@ console.log('\n--- basic git operations are reachable from the UI ---')
 
   // Exactly the six modules, including Output, exposed by the activity bar.
   const moduleLabels = activityItems(tree).map((node) => node.props['data-module'])
-  check('renders six modules including Output',
-    moduleLabels.length === 6 && moduleLabels.includes('output'),
+  check('renders seven modules including Worktrees and Output',
+    moduleLabels.length === 7 && moduleLabels.includes('worktrees') && moduleLabels.includes('output'),
     JSON.stringify(moduleLabels))
 }
 
@@ -2966,6 +2966,277 @@ console.log('\n--- LFS reconnects after repeated status failures ---')
   check('LFS unlocks controls after confirmed completion',
     findAll(tree, 'button').find(node => textOf(node) === t('action.refresh'))?.props.disabled === false)
   runCleanups()
+}
+
+console.log('\n--- worktree browsing, removal and target discovery ---')
+{
+  const taskRoot = ROOT + '-task'
+  const main = { path: ROOT, head: 'a'.repeat(40), branch: 'refs/heads/main' }
+  const task = { path: taskRoot, head: 'b'.repeat(40), branch: 'refs/heads/task' }
+  let trees = [main, task]
+  const counts = { staged: 0, unstaged: 0, untracked: 0, conflicts: 0, ignored: 0, total: 0 }
+  tree = await renderApp(healthyHandlers({
+    worktrees: () => trees,
+    worktreeDetails: payload => ({ ...trees.find(item => item.path === payload.directory), counts, operation: null }),
+    'write.removeWorktree': payload => { trees = trees.filter(item => item.path !== payload.directory); return { message: 'removed' } },
+  }))
+  tree = await selectModule(tree, 'worktrees')
+  check('worktree module renders current and linked directories', hasText(tree, taskRoot) && hasText(tree, t('wt.current')))
+  const discoveryCount = mounted.rpc.calls.filter(call => call.method === 'repos').length
+  findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('selecting a worktree only previews it', mounted.rpc.calls.filter(call => call.method === 'repos').length === discoveryCount &&
+    !mounted.rpc.calls.some(call => call.method.startsWith('write.')))
+  let remove = findAll(tree, 'button').find(node => textOf(node) === t('wt.remove'))
+  check('a clean linked worktree can be removed', remove && !remove.props.disabled)
+  remove.props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('removal shows the target path before sending a write', hasText(tree, t('wt.removeConfirm', { path: taskRoot })) &&
+    !mounted.rpc.calls.some(call => call.method === 'write.removeWorktree'))
+  findAll(tree, 'button').filter(node => textOf(node) === t('wt.remove')).at(-1).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const removal = mounted.rpc.calls.find(call => call.method === 'write.removeWorktree')?.payload
+  check('removal targets the selected directory with a reviewed identity', removal?.root === ROOT && removal.directory === taskRoot &&
+    removal.expectedHead === task.head && removal.expectedBranch === task.branch && removal.confirm === true)
+  check('removed worktree disappears after refresh', !findAll(tree, 'button').some(node => node.props.role === 'option' && hasText(node, taskRoot)))
+}
+console.log('\n--- worktree creation keeps success when opening fails ---')
+{
+  const taskRoot = ROOT + '-retry', counts = { total: 0, staged: 0, unstaged: 0, untracked: 0, conflicts: 0, ignored: 0 }
+  let failOpen = true
+  tree = await renderApp(healthyHandlers({
+    repos: payload => {
+      if (payload.path === taskRoot && failOpen) throw new Error('temporary open failure')
+      return { gitPath: 'git', repos: [{ root: payload.path || ROOT, gitDir: payload.path === taskRoot ? '/git/worktrees/task' : '/git', commonDir: '/git', features: {} }], config: CONFIG }
+    },
+    worktreeDetails: () => ({ counts, operation: null }),
+    'write.addWorktree': () => ({ message: 'created' }),
+  }))
+  tree = await selectModule(tree, 'worktrees')
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.create')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'input').find(node => node.props.name === 'name').props.onChange({ target: { value: 'retry-task' } })
+  findAll(tree, 'input').find(node => node.props.name === 'directory').props.onChange({ target: { value: taskRoot } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  let form = findAll(tree, 'form').find(node => node.props['aria-label'] === t('wt.create'))
+  form.props.onSubmit({ preventDefault() {} })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('creation failure to open retains the created directory and retry form', hasText(tree, t('wt.created', { path: taskRoot })) && hasText(tree, 'temporary open failure'))
+  check('worktree creation sends the chosen branch and directory', mounted.rpc.calls.filter(call => call.method === 'write.addWorktree').length === 1 &&
+    mounted.rpc.calls.find(call => call.method === 'write.addWorktree').payload.name === 'retry-task')
+  failOpen = false
+  form = findAll(tree, 'form').find(node => node.props['aria-label'] === t('wt.create'))
+  form.props.onSubmit({ preventDefault() {} })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('retry opens using fresh discovery without recreating the worktree', mounted.rpc.calls.filter(call => call.method === 'write.addWorktree').length === 1 &&
+    mounted.rpc.calls.some(call => call.method === 'status' && call.payload.root === taskRoot) &&
+    !findAll(tree, 'form').some(node => node.props['aria-label'] === t('wt.create')))
+}
+
+console.log('\n--- offline worktree lock previews and stale form protection ---')
+{
+  const taskRoot = ROOT + '-offline'
+  const main = { path: ROOT, head: 'a'.repeat(40), branch: 'refs/heads/main' }
+  let task = { path: taskRoot, head: 'b'.repeat(40), branch: 'refs/heads/offline' }
+  tree = await renderApp(healthyHandlers({
+    worktrees: () => [main, task],
+    worktreeDetails: payload => {
+      if (payload.directory === taskRoot) throw new Error('offline directory')
+      return { counts: { total: 0 }, operation: null }
+    },
+    worktreeManagementPreview: payload => ({ action: payload.action, tree: task, reason: payload.reason, token: 'lock-token' }),
+    'write.manageWorktree': payload => { task = { ...task, locked: true, lockReason: payload.reason }; return { message: 'locked' } },
+  }))
+  tree = await selectModule(tree, 'worktrees')
+  check('main worktree has no lock action', findAll(tree, 'button').find(node => textOf(node) === t('wt.lock')).props.disabled)
+  findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const lock = findAll(tree, 'button').find(node => textOf(node) === t('wt.lock'))
+  check('an offline worktree can still be locked', lock && !lock.props.disabled)
+  lock.props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  let form = findAll(tree, 'form').find(node => node.props['aria-label'] === t('wt.lock'))
+  findAll(form, 'input').find(node => node.props.name === 'reason').props.onChange({ target: { value: 'external disk' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.checkPreview')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const applyLabel = t('wt.confirmAction', { action: t('wt.lock') })
+  check('lock preview shows the reason and does not write', hasText(tree, 'external disk') &&
+    !mounted.rpc.calls.some(call => call.method === 'write.manageWorktree') &&
+    !findAll(tree, 'button').find(node => textOf(node) === applyLabel).props.disabled)
+  findAll(tree, 'input').find(node => node.props.name === 'reason').props.onChange({ target: { value: 'changed reason' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('editing management parameters invalidates the preview', findAll(tree, 'button').find(node => textOf(node) === applyLabel).props.disabled)
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.checkPreview')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'button').find(node => textOf(node) === applyLabel).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const write = mounted.rpc.calls.find(call => call.method === 'write.manageWorktree')?.payload
+  check('locking sends the selected offline path and reviewed token', write?.root === ROOT && write.directory === taskRoot &&
+    write.reason === 'changed reason' && write.token === 'lock-token' && write.confirm === true)
+  check('successful locking refreshes the list and offers unlock', findAll(tree, 'button').some(node => textOf(node) === t('wt.unlock')))
+}
+console.log('\n--- empty prune preview and move destination review ---')
+{
+  const taskRoot = ROOT + '-move', destination = ROOT + '-moved'
+  const enteredDestination = destination + '/.'
+  const main = { path: ROOT, head: 'a'.repeat(40), branch: 'refs/heads/main' }
+  let task = { path: taskRoot, head: 'b'.repeat(40), branch: 'refs/heads/move' }
+  tree = await renderApp(healthyHandlers({
+    worktrees: () => [main, task],
+    worktreeDetails: () => ({ counts: { total: 1, staged: 0, unstaged: 1, untracked: 0, conflicts: 0 }, operation: null }),
+    worktreeManagementPreview: payload => payload.action === 'prune' ? { action: 'prune', output: '', candidates: [], empty: true, token: 'empty' }
+      : { action: payload.action, tree: task, destination: payload.destination, changes: 1, token: 'move-token' },
+    'write.manageWorktree': () => { task = { ...task, path: destination }; return { message: 'moved', worktreeChange: { action: 'move', from: taskRoot, to: destination } } },
+  }))
+  tree = await selectModule(tree, 'worktrees')
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.prune')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.checkPreview')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('empty prune preview explains there is nothing to remove', hasText(tree, t('wt.nothingToPrune')) &&
+    findAll(tree, 'button').find(node => textOf(node) === t('wt.confirmAction', { action: t('wt.prune') })).props.disabled &&
+    !mounted.rpc.calls.some(call => call.method === 'write.manageWorktree'))
+  const pruneForm = findAll(tree, 'form').find(node => node.props['aria-label'] === t('wt.prune'))
+  findAll(pruneForm, 'button').find(node => textOf(node) === t('action.cancel')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const move = findAll(tree, 'button').find(node => textOf(node) === t('wt.move'))
+  check('move is available for a dirty linked worktree', !move.props.disabled)
+  move.props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'input').find(node => node.props.name === 'destination').props.onChange({ target: { value: enteredDestination } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.checkPreview')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('move preview shows both paths and preserved changes', hasText(tree, taskRoot + ' → ' + enteredDestination) && hasText(tree, t('wt.moveChanges', { count: 1 })))
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.confirmAction', { action: t('wt.move') })).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const write = mounted.rpc.calls.find(call => call.method === 'write.manageWorktree')?.payload
+  check('move submits the reviewed destination and selects the actual Host path', write?.action === 'move' && write.destination === enteredDestination && write.token === 'move-token' &&
+    findAll(tree, 'button').some(node => node.props.role === 'option' && node.props['aria-selected'] && hasText(node, destination)))
+}
+
+console.log('\n--- worktree task notes survive navigation and can be searched ---')
+{
+  const noteStorage = new Map()
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: key => noteStorage.get(key) || null, setItem: (key, value) => noteStorage.set(key, value) } })
+  const taskRoot = ROOT + '-notes', task = { path: taskRoot, branch: 'refs/heads/notes', head: 'b'.repeat(40) }
+  tree = await renderApp(healthyHandlers({
+    worktrees: () => [{ path: ROOT, branch: 'refs/heads/main', head: 'a'.repeat(40) }, task],
+    worktreeDetails: () => ({ counts: { total: 0 }, operation: null }),
+  }))
+  tree = await selectModule(tree, 'worktrees')
+  findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'textarea').find(node => node.props.name === 'worktreeNote').props.onChange({ target: { value: 'repair payment retry' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const refreshCount = mounted.rpc.calls.filter(call => call.method === 'worktrees').length
+  findAll(tree, 'button').find(node => textOf(node) === t('action.refresh')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('refresh also guards an unsaved task note', hasText(tree, t('wt.noteLeave')) && mounted.rpc.calls.filter(call => call.method === 'worktrees').length === refreshCount)
+  findAll(tree, 'button').find(node => node.props.role === 'option' && !hasText(node, taskRoot)).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('unsaved task notes guard worktree selection', hasText(tree, t('wt.noteLeave')) &&
+    findAll(tree, 'button').some(node => node.props.role === 'option' && node.props['aria-selected'] && hasText(node, taskRoot)))
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.saveContinue')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('saving the task note completes the pending selection', findAll(tree, 'button').some(node => node.props.role === 'option' && node.props['aria-selected'] && !hasText(node, taskRoot)))
+  findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('task notes persist when reopening worktree details', findAll(tree, 'textarea').find(node => node.props.name === 'worktreeNote').props.value === 'repair payment retry')
+  findAll(tree, 'input').find(node => node.props['aria-label'] === t('wt.search')).props.onChange({ target: { value: 'payment retry' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('worktree search includes task notes without writing to Git', findAll(tree, 'button').filter(node => node.props.role === 'option').length === 1 &&
+    !mounted.rpc.calls.some(call => call.method.startsWith('write.')))
+}
+console.log('\n--- unsaved worktree notes survive native session remounts ---')
+{
+  const taskRoot = ROOT + '-native-note'
+  const handlers = healthyHandlers({
+    worktrees: () => [{ path: ROOT, branch: 'refs/heads/main', head: 'a'.repeat(40) }, { path: taskRoot, branch: 'refs/heads/task', head: 'b'.repeat(40) }],
+    worktreeDetails: () => ({ counts: { total: 0 }, operation: null }),
+  })
+  const reopen = async () => {
+    runCleanups()
+    let current = await renderApp(handlers)
+    current = await selectModule(current, 'worktrees')
+    findAll(current, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
+    return flush(GitApp, { connection: mounted.rpc, t })
+  }
+  tree = await reopen()
+  findAll(tree, 'textarea').find(node => node.props.name === 'worktreeNote').props.onChange({ target: { value: 'draft across native sessions' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  // Native DSH navigation unmounts the session-keyed GitApp without navigate().
+  tree = await reopen()
+  check('native session remount restores the unsaved draft', findAll(tree, 'textarea').find(node => node.props.name === 'worktreeNote').props.value === 'draft across native sessions')
+  check('restoring a draft keeps it unsaved', !findAll(tree, 'button').find(node => textOf(node) === t('wt.saveNote')).props.disabled && hasText(tree, t('wt.unsavedNote')))
+  findAll(tree, 'button').find(node => node.props.role === 'option' && !hasText(node, taskRoot)).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.discardContinue')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  tree = await reopen()
+  check('explicitly discarded drafts do not return after a session remount', findAll(tree, 'textarea').find(node => node.props.name === 'worktreeNote').props.value === '')
+  findAll(tree, 'textarea').find(node => node.props.name === 'worktreeNote').props.onChange({ target: { value: 'saved after native navigation' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'form').find(node => findAll(node, 'textarea').some(input => input.props.name === 'worktreeNote')).props.onSubmit({ preventDefault() {} })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  tree = await reopen()
+  check('saved notes reopen as saved after a native session remount', findAll(tree, 'textarea').find(node => node.props.name === 'worktreeNote').props.value === 'saved after native navigation' &&
+    findAll(tree, 'button').find(node => textOf(node) === t('wt.saveNote')).props.disabled)
+}
+
+console.log('\n--- cross-worktree content comparison uses the snapshot for previews ---')
+{
+  const taskRoot = ROOT + '-compare', file = { path: 'snapshot.txt', status: 'M', binary: false }
+  tree = await renderApp(healthyHandlers({
+    worktrees: () => [{ path: ROOT, branch: 'refs/heads/main', head: 'a'.repeat(40) }, { path: taskRoot, branch: 'refs/heads/task', head: 'b'.repeat(40) }],
+    worktreeDetails: () => ({ counts: { total: 1 }, operation: null }),
+    worktreeCompare: payload => ({ token: 'snapshot-token', from: payload.from, to: payload.to, files: [file], createdAt: 1790740000000, skippedSubmodules: [] }),
+    worktreeCompareFile: payload => payload.mode === 'diff' ? { files: [{ ...file, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-before', '+after'] }] }] }
+      : { exists: true, text: payload.mode === 'before' ? 'before' : 'after', binary: false },
+  }))
+  tree = await selectModule(tree, 'worktrees')
+  findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.compare')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('worktree comparison explicitly targets current and selected directories', mounted.rpc.calls.some(call => call.method === 'worktreeCompare' && call.payload.from === ROOT && call.payload.to === taskRoot))
+  check('snapshot diff renders through the existing file preview', hasText(tree, 'after') && mounted.rpc.calls.some(call => call.method === 'worktreeCompareFile' && call.payload.token === 'snapshot-token' && call.payload.mode === 'diff'))
+  findAll(tree, 'button').find(node => node.props['aria-label'] === t('wt.leftContent')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('left content reads from the same immutable snapshot', mounted.rpc.calls.some(call => call.method === 'worktreeCompareFile' && call.payload.token === 'snapshot-token' && call.payload.mode === 'before'))
+  findAll(tree, 'button').find(node => textOf(node) === t('compare.swap')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('swapping worktrees generates a fresh reverse comparison without writes', mounted.rpc.calls.some(call => call.method === 'worktreeCompare' && call.payload.from === taskRoot && call.payload.to === ROOT) &&
+    !mounted.rpc.calls.some(call => call.method.startsWith('write.')))
+}
+
+console.log('\n--- an expired worktree snapshot can be regenerated ---')
+{
+  const taskRoot = ROOT + '-expired', file = { path: 'expired.txt', status: 'M', binary: false }
+  let generations = 0
+  tree = await renderApp(healthyHandlers({
+    worktrees: () => [{ path: ROOT, branch: 'refs/heads/main', head: 'a'.repeat(40) }, { path: taskRoot, branch: 'refs/heads/task', head: 'b'.repeat(40) }],
+    worktreeDetails: () => ({ counts: { total: 1 }, operation: null }),
+    worktreeCompare: payload => ({ token: 'generation-' + (++generations), from: payload.from, to: payload.to, files: [file], createdAt: Date.now() }),
+    worktreeCompareFile: payload => {
+      if (payload.token === 'generation-1') throw Object.assign(new Error('expired snapshot'), { code: 'git/worktree-snapshot-expired' })
+      return { files: [{ ...file, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-old snapshot', '+regenerated content'] }] }] }
+    },
+  }))
+  tree = await selectModule(tree, 'worktrees')
+  findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.compare')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('expired snapshots offer a direct regeneration action', hasText(tree, t('wt.snapshotExpired')) &&
+    findAll(tree, 'button').some(node => textOf(node) === t('wt.refreshSnapshot')))
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.refreshSnapshot')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('regeneration uses a new snapshot token and renders its content', generations === 2 && hasText(tree, 'regenerated content') &&
+    !hasText(tree, t('wt.snapshotExpired')) && mounted.rpc.calls.some(call => call.method === 'worktreeCompareFile' && call.payload.token === 'generation-2'))
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`)

@@ -52,7 +52,7 @@
     "check": "npm run build && node scripts/check-package.mjs",
     "check:commit": "node scripts/check-commit.mjs",
     "check:ai": "node scripts/check-ai-context.mjs",
-    "test": "npm run build && node scripts/check-runtime.mjs && node scripts/verify-client.mjs",
+    "test": "npm run build && node scripts/check-runtime.mjs && node scripts/check-worktrees.mjs && node scripts/verify-client.mjs",
     "prepack": "npm run check",
     "build": "node scripts/build-client.mjs"
   },
