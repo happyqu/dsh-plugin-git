@@ -3655,6 +3655,143 @@ console.log('\n--- an expired worktree snapshot can be regenerated ---')
     !hasText(tree, t('wt.snapshotExpired')) && mounted.rpc.calls.some(call => call.method === 'worktreeCompareFile' && call.payload.token === 'generation-2'))
 }
 
+console.log('\n--- header launchers restore their own repository after sidebar navigation ---')
+{
+  runCleanups()
+  const fixture = loadClientModule(source.replace('    return module.exports',
+    '    module.exports.HeaderGitCluster = HeaderGitCluster;\n    module.exports.getWindowState = getWindowState;\n    module.exports.openGitWindow = openGitWindow;\n    module.exports.setWindowState = setWindowState;\n    return module.exports'))
+  const rpc = createRpcStub(healthyHandlers())
+  const props = { connection: rpc, t, sessionId: 'session-A', directory: ROOT }
+  const Component = fixture.HeaderGitCluster
+  mount(Component, props)
+  let header = await flush(Component, props)
+  const openB = () => fixture.openGitWindow({ directory: 'D:/other-workspace' })
+  const ownContext = () => {
+    const state = fixture.getWindowState()
+    return state.sessionId === props.sessionId && state.directory === ROOT && state.workspace === ROOT && state.mode === 'full' && !state.minimized
+  }
+  const clickChip = async name => {
+    findAll(header, 'button').find(node => node.props['data-chip'] === name).props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) } })
+    header = await flush(Component, props)
+  }
+  openB(); header = await flush(Component, props)
+  // Refresh A while the sidebar-opened B is visible; header discovery must not
+  // publish A's repository name into B's window.
+  fixture.setWindowState({ refreshToken: fixture.getWindowState().refreshToken + 1 })
+  header = await flush(Component, props)
+  check('header refresh leaves a sidebar-opened workspace title and directory intact', fixture.getWindowState().workspace === 'D:/other-workspace' && fixture.getWindowState().directory === 'D:/other-workspace')
+  await clickChip('branch')
+  walk(header).find(node => node.props?.['data-picker-branch'] === 'refs/heads/feature/新功能').props.onContextMenu({ clientX: 100, clientY: 120, preventDefault() {}, stopPropagation() {} })
+  header = await flush(Component, props)
+  const menu = walk(header).find(node => node.props?.className === 'dshgit-contextmenu')
+  findAll(menu, 'button').find(node => textOf(node).includes(t('wb.compare'))).props.onClick()
+  header = await flush(Component, props)
+  check('header branch comparison restores A after sidebar opened B', ownContext() && fixture.getWindowState().tab === 'compare' && fixture.getWindowState().compareWith === 'refs/heads/feature/新功能')
+  openB(); header = await flush(Component, props)
+  await clickChip('changes')
+  walk(header).find(node => node.props?.title === 'src/index.js' && node.props.onContextMenu).props.onContextMenu({ clientX: 100, clientY: 120, preventDefault() {}, stopPropagation() {} })
+  header = await flush(Component, props)
+  const fileMenu = walk(header).find(node => node.props?.className === 'dshgit-contextmenu')
+  findAll(fileMenu, 'button').find(node => textOf(node).includes(t('action.fileHistory'))).props.onClick()
+  header = await flush(Component, props)
+  check('header file history restores A and its file path after sidebar opened B', ownContext() && fixture.getWindowState().tab === 'history' && fixture.getWindowState().historyPath === 'src/index.js' && !fixture.getWindowState().compareWith)
+  openB(); header = await flush(Component, props)
+  // The header launcher must focus its own repository instead of closing the
+  // already-open window for B, or restoring B when it was minimized.
+  const launcher = () => findAll(header, 'button').find(node => node.props['aria-label'] === t('window.open'))
+  launcher().props.onClick(); header = await flush(Component, props)
+  check('header launcher switches from sidebar workspace B back to A', ownContext())
+  launcher().props.onClick(); header = await flush(Component, props)
+  check('header launcher still closes its own already-open window', fixture.getWindowState().mode === 'closed')
+  openB(); fixture.setWindowState({ minimized: true }); header = await flush(Component, props)
+  launcher().props.onClick(); header = await flush(Component, props)
+  check('header launcher restores its own context when B was minimized', ownContext())
+  runCleanups()
+  const legacyProps = { connection: rpc, t, sessionId: 'legacy-session' }
+  mount(Component, legacyProps)
+  header = await flush(Component, legacyProps)
+  openB(); header = await flush(Component, legacyProps)
+  findAll(header, 'button').find(node => node.props['data-chip'] === 'changes').props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) } })
+  header = await flush(Component, legacyProps)
+  findAll(header, 'button').find(node => textOf(node) === t('commit.openFull')).props.onClick()
+  check('headers without workspace hooks use their resolved repository instead of inheriting B', fixture.getWindowState().sessionId === 'legacy-session' && fixture.getWindowState().directory === ROOT && fixture.getWindowState().workspace === ROOT)
+  header = await flush(Component, legacyProps)
+  findAll(header, 'button').find(node => node.props['aria-label'] === t('window.open')).props.onClick()
+  check('legacy header launchers still close their own resolved repository window', fixture.getWindowState().mode === 'closed')
+}
+
+// Exercise the sidebar adapter against Host-shaped keyed rows, including the
+// real activation callback that opens the shared window for another directory.
+{
+  runCleanups()
+  const sidebarClient = loadClientModule(source.replace('    return module.exports',
+    '    module.exports.getWindowState = getWindowState;\n    module.exports.setWindowState = setWindowState;\n    return module.exports'))
+  class Node {
+    constructor(tag = 'span') { this.tag = tag; this.children = []; this.attributes = {}; this.events = {}; this.className = ''; this.dataset = {} }
+    get firstChild() { return this.children[0] || null }
+    get lastElementChild() { return this.children.at(-1) }
+    setAttribute(key, value) { this.attributes[key] = value }
+    getAttribute(key) { return this.attributes[key] ?? null }
+    appendChild(node) { this.insertBefore(node, null) }
+    insertBefore(node, before) { node.remove(); this.children.splice(before ? this.children.indexOf(before) : this.children.length, 0, node); node.parentElement = this }
+    remove() { if (this.parentElement) this.parentElement.children.splice(this.parentElement.children.indexOf(this), 1); this.parentElement = null }
+    addEventListener(type, handler) { this.events[type] = handler }
+    matches() { return this.attributes.role === 'treeitem' && this.attributes['data-row-key']?.startsWith('workspace:') }
+    closest(selector) { return this.matches(selector) ? this : this.parentElement?.closest(selector) }
+    querySelector(selector) {
+      for (const node of this.children) {
+        if (selector === 'button' ? node.tag === 'button' : node.matches(selector)) return node
+        const nested = node.querySelector(selector); if (nested) return nested
+      }
+      return null
+    }
+  }
+  const row = id => {
+    const node = new Node('div'), strip = new Node(), native = new Node('button')
+    node.setAttribute('role', 'treeitem'); node.setAttribute('data-row-key', 'workspace:' + id)
+    native.className = 'host-icon-button'; strip.appendChild(native); node.appendChild(strip)
+    return node
+  }
+  const rows = [row('one'), row('two'), row('')]
+  let items = [{ workspaceId: 'one', title: 'Same name', path: 'D:/one' }, { workspaceId: 'two', title: 'Same name', path: 'D:/two' }]
+  let listener, observer, disconnected = false, unsubscribed = false
+  const previousObserver = globalThis.MutationObserver
+  globalThis.MutationObserver = class {
+    constructor(callback) { observer = callback }
+    observe() {}
+    disconnect() { disconnected = true }
+  }
+  const originalCreate = document.createElement
+  document.createElement = tag => tag === 'style' ? originalCreate(tag) : new Node(tag)
+  document.createElementNS = (_, tag) => new Node(tag)
+  document.querySelectorAll = () => rows
+  const context = createClientContext({ connection: createRpcStub(healthyHandlers()) })
+  context.ctx.workspaces = { list: { getSnapshot: () => ({ items }), subscribe: callback => { listener = callback; return () => { unsubscribed = true } } } }
+  sidebarClient.apply(context.ctx)
+  const gitButton = node => node.lastElementChild.children.find(child => child.className.includes('dshgit-sidebar-workspace-git'))
+  check('sidebar Git joins the native workspace hover action strip', rows.slice(0, 2).every(node => gitButton(node)?.className.includes('host-icon-button')))
+  check('ungrouped sidebar rows have no workspace Git action', !gitButton(rows[2]))
+  sidebarClient.setWindowState({ mode: 'full', minimized: true, sessionId: 'old-session', directory: 'D:/old', workspace: 'D:/old', tab: 'history', historyPath: 'old.txt', compareWith: 'old-ref' })
+  let stopped = 0, prevented = 0
+  gitButton(rows[1]).events.click({ stopPropagation() { stopped++ }, preventDefault() { prevented++ } })
+  const state = sidebarClient.getWindowState()
+  check('sidebar Git opens the clicked workspace rather than the active conversation', state.directory === 'D:/two' && state.workspace === 'D:/two' && state.sessionId === '')
+  check('sidebar Git restores the window and clears previous repository view context', state.mode === 'full' && !state.minimized && state.tab === 'changes' && !state.historyPath && !state.compareWith)
+  check('sidebar Git consumes clicks without opening or collapsing the workspace', stopped === 1 && prevented === 1)
+  listener(); listener()
+  check('repeated workspace updates do not duplicate Git buttons', rows[1].lastElementChild.children.length === 2)
+  items = [{ workspaceId: 'two', title: 'Renamed', path: 'D:/moved' }]; listener()
+  check('workspace deletion removes its Git button and rename updates the accessible label', !gitButton(rows[0]) && gitButton(rows[1]).getAttribute('aria-label').includes('Renamed'))
+  gitButton(rows[1]).events.click({ stopPropagation() {}, preventDefault() {} })
+  check('sidebar Git uses the latest workspace directory after registry updates', sidebarClient.getWindowState().directory === 'D:/moved')
+  const replacement = row('two'); rows.splice(1, 1, replacement)
+  observer([{ target: new Node('div'), addedNodes: [replacement], removedNodes: [] }])
+  check('replaced sidebar workspace rows regain their Git action', !!gitButton(replacement))
+  context.effects.find(effect => effect?.label === 'git: sidebar workspace actions').result()
+  check('plugin disposal removes sidebar actions and observers', disconnected && unsubscribed && rows.every(node => !gitButton(node)))
+  globalThis.MutationObserver = previousObserver
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`)
 if (failures > 0) {
   console.error(`${failures} FAILED`)
