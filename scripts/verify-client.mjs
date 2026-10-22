@@ -206,6 +206,9 @@ function healthyHandlers(overrides = {}) {
     stashes: () => [{ ref: 'stash@{0}', sha: '9'.repeat(40), message: 'On main: 临时改动：README 草稿', date: 1790740000 }],
     stashDiff: () => COMMIT_DIFF,
     worktrees: () => [{ path: ROOT, head: 'a'.repeat(40), branch: 'refs/heads/main', bare: false, detached: false }],
+    worktreeCreatePreview: () => ({ valid: true, errors: {}, head: 'a'.repeat(40) }),
+    worktreeRemovalPreview: payload => ({ tree: { path: payload.directory, head: 'b'.repeat(40), branch: 'refs/heads/task' }, removable: true,
+      blockers: [], files: [], ignoredPaths: [], fileCount: 0, ignoredCount: 0 }),
     commits: () => COMMITS,
     commit: () => COMMIT_DETAIL,
     commitGraph: () => GRAPH,
@@ -345,7 +348,7 @@ console.log('--- module surface ---')
 // One shared stub instance, so the grammar the preview asked for can be
 // asserted later rather than only inferred from the colours.
 const primitives = primitivesStub()
-const loaded = loadClientModule(source, { require: { '@deepseek-ai/dsh-client-ui-primitives': primitives.module } })
+const loaded = loadClientModule(source.replace('    return module.exports', '    module.exports.registerWorktreeWorkspace = registerWorktreeWorkspace;\n    return module.exports'), { require: { '@deepseek-ai/dsh-client-ui-primitives': primitives.module } })
 // The bundle registers under its npm package id, which is scoped.
 check('loaded through __ModuleLoader__ with the package id', loaded.id === '@happyqu/dsh-plugin-git', String(loaded.id))
 check('exports a name', typeof loaded.name === 'string' && loaded.name.length > 0, String(loaded.name))
@@ -2968,6 +2971,171 @@ console.log('\n--- LFS reconnects after repeated status failures ---')
   runCleanups()
 }
 
+async function openWorktreeManagement(view) {
+  findAll(view, 'button').find(node => node.props['aria-label'] === t('wt.manage') && node.props['aria-haspopup'] === 'menu').props.onClick({ stopPropagation() {} })
+  return flush(GitApp, { connection: mounted.rpc, t })
+}
+async function openWorktreeNote(view) {
+  if (findAll(view, 'textarea').some(node => node.props.name === 'worktreeNote')) return view
+  findAll(view, 'button').find(node => [t('wt.addNote'), t('wt.editNote')].includes(textOf(node))).props.onClick()
+  return flush(GitApp, { connection: mounted.rpc, t })
+}
+async function closeWorktreeNote(view) {
+  const dialog = findAll(view, 'div').find(node => node.props.role === 'dialog' && node.props['aria-label'] === t('wt.taskNote'))
+  findAll(dialog, 'button').find(node => textOf(node) === t('action.close')).props.onClick()
+  return flush(GitApp, { connection: mounted.rpc, t })
+}
+
+console.log('\n--- worktree synchronization follows external edits and visibility ---')
+{
+  runCleanups()
+  const { useWorktrees: useWorktreesFixture } = loadClientModule(source.replace('    return module.exports', '    module.exports.useWorktrees = useWorktrees;\n    return module.exports'))
+  const realTimeout = globalThis.setTimeout, realClear = globalThis.clearTimeout
+  const timers = new Map(), calls = []
+  let sequence = 0, model, version = 0, changed = 0
+  let trees = [{ path: ROOT, head: 'a'.repeat(40), branch: 'refs/heads/main' }, { path: ROOT + '-sync', head: 'b'.repeat(40), branch: 'refs/heads/task' }]
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (delay !== 5000 && delay !== 1000) return realTimeout(callback, delay, ...args)
+    const id = --sequence; timers.set(id, callback); return id
+  }
+  globalThis.clearTimeout = id => { if (timers.has(id)) timers.delete(id); else realClear(id) }
+  const run = async (method, payload, options) => {
+    calls.push({ method, payload, signal: options.signal })
+    if (method === 'worktrees') return trees
+    if (method === 'repositoryVersion') return { generation: 1, version, supported: true }
+    if (method === 'worktreeDetails') return { counts: { total: changed, ignored: 0 }, operation: null }
+    throw new Error(method)
+  }
+  const fire = async () => {
+    const [id, callback] = timers.entries().next().value
+    timers.delete(id); await callback()
+  }
+  function WorktreesFixture(props) {
+    model = useWorktreesFixture({ root: ROOT }, run, props.enabled, 0, props.busy)
+    return h('div', null, model.trees.length)
+  }
+  let props = { enabled: true, busy: false }
+  try {
+    mount(WorktreesFixture, props)
+    await flush(WorktreesFixture, props)
+    const initialDetails = calls.filter(call => call.method === 'worktreeDetails').length
+    check('synchronization initially reads each worktree', model.trees.length === 2 && initialDetails === 2)
+    await fire(); await flush(WorktreesFixture, props)
+    check('unchanged worktree versions do not launch fresh status scans', calls.filter(call => call.method === 'worktreeDetails').length === initialDetails)
+    version++; changed = 3
+    trees = trees.concat({ path: ROOT + '-external', head: 'c'.repeat(40), branch: 'refs/heads/external' })
+    await fire(); await flush(WorktreesFixture, props)
+    check('external creation and file changes appear without manual refresh', model.trees.length === 3 && model.details[ROOT + '-sync'].counts.total === 3)
+    model.select(ROOT + '-external'); await flush(WorktreesFixture, props)
+    trees = trees.slice(0, 2); version++
+    await fire(); await flush(WorktreesFixture, props)
+    check('external removal evicts its details and selects the current worktree', model.selected === ROOT && !model.details[ROOT + '-external'])
+    props = { enabled: true, busy: true }; await flush(WorktreesFixture, props)
+    const beforeBusy = calls.length
+    await fire(); await flush(WorktreesFixture, props)
+    check('worktree synchronization waits for active writes', calls.length === beforeBusy)
+    props = { enabled: true, busy: false }; await flush(WorktreesFixture, props)
+    await fire(); await flush(WorktreesFixture, props)
+    document.hidden = true
+    const beforeHidden = calls.length
+    await fire(); await flush(WorktreesFixture, props)
+    check('hidden pages stop worktree polling', calls.length === beforeHidden && timers.size === 0)
+    document.hidden = false; version++; changed = 4
+    window.listeners.get('focus').forEach(listener => listener())
+    await flush(WorktreesFixture, props)
+    check('returning to the page immediately refreshes worktree status', model.details[ROOT + '-sync'].counts.total === 4)
+    props = { enabled: false, busy: false }; await flush(WorktreesFixture, props)
+    // This renderer runs dependency cleanups only when explicitly unmounted.
+    runCleanups()
+    check('unmounting the module aborts reads and releases timers and listeners', timers.size === 0 && calls.every(call => call.signal.aborted) && window.listeners.get('focus').length === 0)
+  } finally {
+    runCleanups(); document.hidden = false
+    globalThis.setTimeout = realTimeout; globalThis.clearTimeout = realClear
+  }
+}
+
+console.log('\n--- quick worktree opening preserves preview and navigation guards ---')
+{
+  runCleanups()
+  const { WorktreesSidebar, registerNavigationGuard: guard, approveNavigation: approve } = loadClientModule(source.replace('    return module.exports',
+    '    module.exports.WorktreesSidebar = WorktreesSidebar; module.exports.registerNavigationGuard = registerNavigationGuard; module.exports.approveNavigation = approveNavigation;\n    return module.exports'))
+  const taskPath = ROOT + '-quick'
+  const task = { path: taskPath, branch: 'refs/heads/task', head: 'b'.repeat(40) }
+  const bare = { path: ROOT + '-bare', bare: true }, offline = { path: ROOT + '-offline' }
+  const opens = [], selections = []
+  let release, fail = false
+  const model = { trees: [task, bare, offline], details: { [taskPath]: { counts: { total: 0 } }, [offline.path]: { error: 'offline' } },
+    metadata: {}, context: { items: [], byId: {} }, selected: ROOT, select: path => selections.push(path) }
+  let props = { t, root: ROOT, model, busy: false, onSelect() {},
+    onOpenWorkspace: async path => { opens.push({ kind: 'workspace', path }); await new Promise(resolve => { release = resolve }) },
+    onOpenGit: async path => { opens.push({ kind: 'git', path }); if (fail) throw new Error('opening failed') } }
+  const row = path => findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, path))
+  const key = (extra = {}) => ({ key: 'Enter', preventDefault() {}, stopPropagation() {}, ...extra })
+  mount(WorktreesSidebar, props); tree = await flush(WorktreesSidebar, props)
+  row(taskPath).props.onClick(); tree = await flush(WorktreesSidebar, props)
+  check('single-click remains a preview without opening a directory', selections[0] === taskPath && opens.length === 0)
+  let queued
+  const disposeGuard = guard(action => { queued = action; return false })
+  row(taskPath).props.onKeyDown(key()); tree = await flush(WorktreesSidebar, props)
+  check('keyboard opening waits for an unsaved-note navigation guard', opens.length === 0 && typeof queued === 'function')
+  disposeGuard(); approve(queued); tree = await flush(WorktreesSidebar, props)
+  check('approved Enter navigation opens the intended DSH workspace', opens.length === 1 && opens[0].kind === 'workspace' && opens[0].path === taskPath && row(taskPath).props['aria-busy'] && row(taskPath).props['aria-disabled'] && !row(taskPath).props.disabled)
+  row(taskPath).props.onDoubleClick(); row(taskPath).props.onKeyDown(key())
+  tree = await flush(WorktreesSidebar, props)
+  check('repeated opening gestures share one in-flight navigation', opens.length === 1)
+  release(); tree = await flush(WorktreesSidebar, props)
+  row(taskPath).props.onKeyDown(key({ ctrlKey: true })); tree = await flush(WorktreesSidebar, props)
+  row(taskPath).props.onKeyDown(key({ metaKey: true })); tree = await flush(WorktreesSidebar, props)
+  check('Ctrl and Command plus Enter explicitly open Git instead of a workspace', opens.length === 3 && opens.slice(1).every(item => item.kind === 'git' && item.path === taskPath))
+  row(taskPath).props.onKeyDown(key({ isComposing: true })); row(taskPath).props.onKeyDown(key({ repeat: true }))
+  row(bare.path).props.onDoubleClick(); row(offline.path).props.onDoubleClick()
+  tree = await flush(WorktreesSidebar, props)
+  check('composition, repeated keydown and unavailable directories do not navigate', opens.length === 3)
+  props = { ...props, onOpenWorkspace: null }
+  tree = await flush(WorktreesSidebar, props)
+  row(taskPath).props.onDoubleClick(); tree = await flush(WorktreesSidebar, props)
+  check('double-click falls back to Git when workspace integration is unavailable', opens.length === 4 && opens.at(-1).kind === 'git' && row(taskPath).props.title.includes(t('wt.quickOpenGitHint')))
+  fail = true
+  row(taskPath).props.onDoubleClick(); tree = await flush(WorktreesSidebar, props)
+  check('navigation failures restore controls and expose the error', hasText(tree, 'opening failed') && !row(taskPath).props['aria-disabled'])
+  fail = false
+  row(taskPath).props.onDoubleClick(); tree = await flush(WorktreesSidebar, props)
+  check('a failed quick opening can be retried', opens.length === 6 && !hasText(tree, 'opening failed'))
+  runCleanups()
+}
+
+console.log('\n--- quick opening revalidates worktrees and reuses DSH workspaces ---')
+{
+  let unavailable = false, creates = 0
+  const navigations = [], taskRoot = ROOT + '-quick-workspace'
+  const dispose = loaded.registerWorktreeWorkspace({
+    workspaces: { create: async value => { creates++; return { workspaceId: 'quick-task', path: value.path } } },
+    navigation: { openWorkspace: async id => { navigations.push(id) } },
+  })
+  try {
+    tree = await renderApp(healthyHandlers({
+      repos: payload => ({ gitPath: 'git', repos: [{ root: payload.path || ROOT, commonDir: '/git', features: {} }], config: CONFIG }),
+      worktrees: () => [{ path: ROOT, head: 'a'.repeat(40), branch: 'refs/heads/main' }, { path: taskRoot, head: 'b'.repeat(40), branch: 'refs/heads/task' }],
+      worktreeDetails: payload => { if (unavailable && payload.directory === taskRoot) throw new Error('worktree moved externally'); return { counts: { total: 0 }, operation: null } },
+    }))
+    tree = await selectModule(tree, 'worktrees')
+    const row = () => findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot))
+    const before = mounted.rpc.calls.filter(call => call.method === 'repos').length
+    unavailable = true
+    row().props.onDoubleClick(); tree = await flush(GitApp, { connection: mounted.rpc, t })
+    check('an externally invalidated worktree is rejected before creating a DSH workspace', creates === 0 && navigations.length === 0 && hasText(tree, 'worktree moved externally'))
+    unavailable = false
+    row().props.onDoubleClick(); tree = await flush(GitApp, { connection: mounted.rpc, t })
+    row().props.onKeyDown({ key: 'Enter', preventDefault() {}, stopPropagation() {} }); tree = await flush(GitApp, { connection: mounted.rpc, t })
+    check('double-click and Enter reuse the same DSH workspace without switching the Git directory', creates === 1 && navigations.length === 2 && navigations.every(id => id === 'quick-task') &&
+      mounted.rpc.calls.filter(call => call.method === 'repos').length === before)
+    row().props.onKeyDown({ key: 'Enter', ctrlKey: true, preventDefault() {}, stopPropagation() {} })
+    tree = await flush(GitApp, { connection: mounted.rpc, t })
+    check('explicit Git quick opening discovers and loads the selected worktree', mounted.rpc.calls.some(call => call.method === 'repos' && call.payload.path === taskRoot) &&
+      mounted.rpc.calls.some(call => call.method === 'status' && call.payload.root === taskRoot) && navigations.length === 2)
+  } finally { runCleanups(); dispose() }
+}
+
 console.log('\n--- worktree browsing, removal and target discovery ---')
 {
   const taskRoot = ROOT + '-task'
@@ -2987,6 +3155,11 @@ console.log('\n--- worktree browsing, removal and target discovery ---')
   tree = await flush(GitApp, { connection: mounted.rpc, t })
   check('selecting a worktree only previews it', mounted.rpc.calls.filter(call => call.method === 'repos').length === discoveryCount &&
     !mounted.rpc.calls.some(call => call.method.startsWith('write.')))
+  check('worktree details show common actions without disclosure sections or a note editor',
+    !findAll(tree, 'details').some(node => node.props.className === 'dshgit-worktree-disclosure') &&
+    !findAll(tree, 'textarea').some(node => node.props.name === 'worktreeNote') &&
+    [t('wt.openGit'), t('wt.history'), t('wt.compare')].every(label => findAll(tree, 'button').some(node => textOf(node) === label)))
+  tree = await openWorktreeManagement(tree)
   let remove = findAll(tree, 'button').find(node => textOf(node) === t('wt.remove'))
   check('a clean linked worktree can be removed', remove && !remove.props.disabled)
   remove.props.onClick()
@@ -3000,6 +3173,120 @@ console.log('\n--- worktree browsing, removal and target discovery ---')
     removal.expectedHead === task.head && removal.expectedBranch === task.branch && removal.confirm === true)
   check('removed worktree disappears after refresh', !findAll(tree, 'button').some(node => node.props.role === 'option' && hasText(node, taskRoot)))
 }
+console.log('\n--- blocked removal explains files and offers a resolution path ---')
+{
+  const taskRoot = ROOT + '-blocked-removal'
+  const task = { path: taskRoot, head: 'b'.repeat(40), branch: 'refs/heads/task' }
+  let blocked = true
+  tree = await renderApp(healthyHandlers({
+    repos: payload => ({ gitPath: 'git', repos: [{ root: payload.path || ROOT, commonDir: '/git', features: {} }], config: CONFIG }),
+    worktrees: () => [{ path: ROOT, head: 'a'.repeat(40), branch: 'refs/heads/main' }, task],
+    worktreeDetails: () => ({ counts: { total: blocked ? 1 : 0, ignored: blocked ? 1 : 0 }, operation: null }),
+    worktreeRemovalPreview: () => ({ tree: task, removable: !blocked,
+      blockers: blocked ? [{ kind: 'changes', message: 'resolve local files' }, { kind: 'ignored', message: 'preserve ignored files' }] : [],
+      files: blocked ? [{ path: 'new-file.txt', kind: 'untracked' }] : [], ignoredPaths: blocked ? ['.env.local'] : [],
+      fileCount: blocked ? 1 : 0, ignoredCount: blocked ? 1 : 0 }),
+  }))
+  tree = await selectModule(tree, 'worktrees')
+  findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  tree = await openWorktreeManagement(tree)
+  const inspect = findAll(tree, 'button').find(node => textOf(node) === t('wt.remove'))
+  check('dirty worktrees can open removal diagnostics', !inspect.props.disabled)
+  inspect.props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('removal diagnostics identify untracked and ignored paths without writing', hasText(tree, 'new-file.txt') && hasText(tree, '.env.local') &&
+    findAll(tree, 'button').find(node => textOf(node) === t('wt.remove')).props.disabled &&
+    !mounted.rpc.calls.some(call => call.method.startsWith('write.')))
+  blocked = false
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.recheck')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('rechecking enables removal only when fresh diagnostics pass', !findAll(tree, 'button').find(node => textOf(node) === t('wt.remove')).props.disabled &&
+    !hasText(tree, 'new-file.txt') && !mounted.rpc.calls.some(call => call.method.startsWith('write.')))
+  blocked = true
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.recheck')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.openToResolve')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('the resolution action opens the affected directory without deleting it', mounted.rpc.calls.some(call => call.method === 'status' && call.payload.root === taskRoot) &&
+    !mounted.rpc.calls.some(call => call.method === 'write.removeWorktree'))
+}
+
+console.log('\n--- creation preflight rejects stale responses and late conflicts ---')
+{
+  runCleanups()
+  const fixture = source.replace('factory: (require) => {', 'factory: (require) => { var setTimeout = (callback, delay) => globalThis.setTimeout(callback, delay === 300 ? 1 : delay);')
+    .replace('    return module.exports', '    module.exports.CreateWorktreeDialog = CreateWorktreeDialog;\n    return module.exports')
+  const { CreateWorktreeDialog } = loadClientModule(fixture)
+  const requests = [], writes = []
+  const props = { t, repo: { root: ROOT }, refs: REFS, worktrees: [], onOpen: async () => {}, onClose() {}, onCreate: async value => { writes.push(value) },
+    run: (method, payload, options) => new Promise((resolve, reject) => requests.push({ payload, signal: options.signal, resolve, reject })) }
+  const settle = async count => {
+    for (let attempt = 0; requests.length < count && attempt < 30; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 2)); tree = await flush(CreateWorktreeDialog, props)
+    }
+    if (requests.length < count) throw new Error('Preflight did not run')
+  }
+  mount(CreateWorktreeDialog, props)
+  tree = await flush(CreateWorktreeDialog, props)
+  findAll(tree, 'input').find(node => node.props.name === 'name').props.onChange({ target: { value: 'first-name' } })
+  tree = await flush(CreateWorktreeDialog, props); await settle(1)
+  findAll(tree, 'input').find(node => node.props.name === 'name').props.onChange({ target: { value: 'second-name' } })
+  tree = await flush(CreateWorktreeDialog, props); await settle(2)
+  requests[0].resolve({ valid: true, errors: {} })
+  tree = await flush(CreateWorktreeDialog, props)
+  check('an obsolete preflight cannot enable creation for new input', findAll(tree, 'button').find(node => node.props.type === 'submit').props.disabled)
+  requests[1].resolve({ valid: false, errors: { ref: 'invalid start', name: 'branch already exists', directory: 'directory is occupied' } })
+  tree = await flush(CreateWorktreeDialog, props)
+  check('preflight errors appear beside all affected fields', hasText(tree, 'invalid start') && hasText(tree, 'branch already exists') && hasText(tree, 'directory is occupied') &&
+    findAll(tree, 'input').filter(node => ['ref', 'name', 'directory'].includes(node.props.name)).every(node => node.props['aria-invalid']))
+  findAll(tree, 'input').find(node => node.props.name === 'name').props.onChange({ target: { value: 'available-name' } })
+  tree = await flush(CreateWorktreeDialog, props); await settle(3)
+  requests[2].resolve({ valid: true, errors: {} })
+  tree = await flush(CreateWorktreeDialog, props)
+  check('valid current parameters enable creation', !findAll(tree, 'button').find(node => node.props.type === 'submit').props.disabled)
+  findAll(tree, 'form')[0].props.onSubmit({ preventDefault() {} })
+  tree = await flush(CreateWorktreeDialog, props)
+  check('submission performs a fresh read before any write', requests.length === 4 && writes.length === 0 && requests[3].payload.name === 'available-name')
+  requests[3].resolve({ valid: false, errors: { name: 'branch was created externally' } })
+  tree = await flush(CreateWorktreeDialog, props)
+  check('a late branch conflict leaves the form editable and does not create a worktree', hasText(tree, 'branch was created externally') && writes.length === 0 &&
+    findAll(tree, 'button').find(node => node.props.type === 'submit').props.disabled)
+  findAll(tree, 'input').find(node => node.props.name === 'name').props.onChange({ target: { value: 'network-retry' } })
+  tree = await flush(CreateWorktreeDialog, props); await settle(5)
+  requests[4].reject(new Error('temporary preflight disconnect'))
+  tree = await flush(CreateWorktreeDialog, props)
+  check('a preflight connection failure has a retry action and cannot enable creation', hasText(tree, 'temporary preflight disconnect') &&
+    findAll(tree, 'button').some(node => textOf(node) === t('action.retryRead')) && findAll(tree, 'button').find(node => node.props.type === 'submit').props.disabled)
+  findAll(tree, 'button').find(node => textOf(node) === t('action.retryRead')).props.onClick()
+  tree = await flush(CreateWorktreeDialog, props); await settle(6)
+  requests[5].resolve({ valid: true, errors: {} })
+  tree = await flush(CreateWorktreeDialog, props)
+  check('preflight retry preserves all inputs and recovers without writing', JSON.stringify(requests[5].payload) === JSON.stringify(requests[4].payload) &&
+    !findAll(tree, 'button').find(node => node.props.type === 'submit').props.disabled && writes.length === 0 && !hasText(tree, 'temporary preflight disconnect'))
+  runCleanups()
+}
+
+console.log('\n--- existing branch creation suggests its own directory ---')
+{
+  const { CreateWorktreeDialog } = loadClientModule(source.replace('    return module.exports', '    module.exports.CreateWorktreeDialog = CreateWorktreeDialog;\n    return module.exports'))
+  const props = { t, repo: { root: ROOT }, refs: REFS, worktrees: [], subject: { ref: 'refs/heads/feature/新功能' },
+    onClose() {}, onCreate: async () => {}, onOpen: async () => {}, run: async () => ({ valid: true, errors: {} }) }
+  mount(CreateWorktreeDialog, props)
+  tree = await flush(CreateWorktreeDialog, props)
+  findAll(tree, 'input').find(node => node.props.name === 'name').props.onChange({ target: { value: 'unused-new-name' } })
+  findAll(tree, 'input').find(node => node.props.type === 'checkbox').props.onChange({ target: { checked: false } })
+  tree = await flush(CreateWorktreeDialog, props)
+  check('reusing a local branch derives the directory from that branch instead of an unused new-branch name',
+    findAll(tree, 'input').find(node => node.props.name === 'directory').props.value.endsWith('/feature-新功能') &&
+    !findAll(tree, 'input').some(node => node.props.name === 'name'))
+  findAll(tree, 'input').find(node => node.props.name === 'directory').props.onChange({ target: { value: ROOT + '-custom-location' } })
+  findAll(tree, 'input').find(node => node.props.name === 'ref').props.onChange({ currentTarget: { value: 'refs/heads/main' } })
+  tree = await flush(CreateWorktreeDialog, props)
+  check('changing the starting branch preserves an explicitly chosen directory', findAll(tree, 'input').find(node => node.props.name === 'directory').props.value === ROOT + '-custom-location')
+  runCleanups()
+}
+
 console.log('\n--- worktree creation keeps success when opening fails ---')
 {
   const taskRoot = ROOT + '-retry', counts = { total: 0, staged: 0, unstaged: 0, untracked: 0, conflicts: 0, ignored: 0 }
@@ -3033,6 +3320,41 @@ console.log('\n--- worktree creation keeps success when opening fails ---')
     !findAll(tree, 'form').some(node => node.props['aria-label'] === t('wt.create')))
 }
 
+console.log('\n--- worktree creation accepts custom revisions and suggested refs ---')
+for (const sample of [
+  { typed: 'HEAD~2', finish: 'enter', expected: 'HEAD~2' },
+  { typed: 'c'.repeat(40), finish: 'blur', expected: 'c'.repeat(40) },
+  { typed: 'HEAD~3', finish: 'submit', expected: 'HEAD~3' },
+  { typed: ' refs/remotes/origin/main ', finish: 'submit', expected: 'refs/remotes/origin/main', track: true },
+  { typed: 'feature/新功能', finish: 'suggestion', expected: 'refs/heads/feature/新功能' },
+  { typed: 'origin/main', finish: 'suggestion', expected: 'refs/remotes/origin/main', track: true },
+]) {
+  tree = await renderApp(healthyHandlers({ 'write.addWorktree': () => ({ message: 'created' }) }))
+  tree = await selectModule(tree, 'worktrees')
+  findAll(tree, 'button').find(node => textOf(node) === t('wt.create')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'input').find(node => node.props.name === 'ref').props.onChange({ currentTarget: { value: sample.typed } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  let startInput = findAll(tree, 'input').find(node => node.props.name === 'ref')
+  if (sample.finish === 'enter' || sample.finish === 'suggestion') {
+    if (sample.finish === 'suggestion') {
+      startInput.props.onKeyDown({ key: 'ArrowDown', preventDefault() {} })
+      tree = await flush(GitApp, { connection: mounted.rpc, t })
+      startInput = findAll(tree, 'input').find(node => node.props.name === 'ref')
+    }
+    startInput.props.onKeyDown({ key: 'Enter', preventDefault() {} })
+  } else if (sample.finish === 'blur') startInput.props.onBlur()
+  findAll(tree, 'input').find(node => node.props.name === 'name').props.onChange({ target: { value: 'custom-start' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  if (sample.finish !== 'submit') check('starting point stays visible after ' + sample.finish + ': ' + sample.typed,
+    findAll(tree, 'input').find(node => node.props.name === 'ref').props.value === sample.expected)
+  findAll(tree, 'form').find(node => node.props['aria-label'] === t('wt.create')).props.onSubmit({ preventDefault() {} })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const creation = mounted.rpc.calls.find(call => call.method === 'write.addWorktree')?.payload
+  check('creation uses the reviewed starting point: ' + sample.typed,
+    creation?.ref === sample.expected && creation.track === !!sample.track)
+}
+
 console.log('\n--- offline worktree lock previews and stale form protection ---')
 {
   const taskRoot = ROOT + '-offline'
@@ -3048,9 +3370,13 @@ console.log('\n--- offline worktree lock previews and stale form protection ---'
     'write.manageWorktree': payload => { task = { ...task, locked: true, lockReason: payload.reason }; return { message: 'locked' } },
   }))
   tree = await selectModule(tree, 'worktrees')
-  check('main worktree has no lock action', findAll(tree, 'button').find(node => textOf(node) === t('wt.lock')).props.disabled)
+  check('main worktree directly shows history and its current-open state without an empty management menu',
+    findAll(tree, 'button').find(node => textOf(node) === t('wt.alreadyOpen'))?.props.disabled === true &&
+    findAll(tree, 'button').some(node => textOf(node) === t('wt.history')) &&
+    !findAll(tree, 'button').some(node => [t('wt.manage'), t('wt.lock'), t('wt.move'), t('wt.repair')].includes(textOf(node))))
   findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
   tree = await flush(GitApp, { connection: mounted.rpc, t })
+  tree = await openWorktreeManagement(tree)
   const lock = findAll(tree, 'button').find(node => textOf(node) === t('wt.lock'))
   check('an offline worktree can still be locked', lock && !lock.props.disabled)
   lock.props.onClick()
@@ -3074,6 +3400,7 @@ console.log('\n--- offline worktree lock previews and stale form protection ---'
   const write = mounted.rpc.calls.find(call => call.method === 'write.manageWorktree')?.payload
   check('locking sends the selected offline path and reviewed token', write?.root === ROOT && write.directory === taskRoot &&
     write.reason === 'changed reason' && write.token === 'lock-token' && write.confirm === true)
+  tree = await openWorktreeManagement(tree)
   check('successful locking refreshes the list and offers unlock', findAll(tree, 'button').some(node => textOf(node) === t('wt.unlock')))
 }
 console.log('\n--- empty prune preview and move destination review ---')
@@ -3102,6 +3429,7 @@ console.log('\n--- empty prune preview and move destination review ---')
   tree = await flush(GitApp, { connection: mounted.rpc, t })
   findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
   tree = await flush(GitApp, { connection: mounted.rpc, t })
+  tree = await openWorktreeManagement(tree)
   const move = findAll(tree, 'button').find(node => textOf(node) === t('wt.move'))
   check('move is available for a dirty linked worktree', !move.props.disabled)
   move.props.onClick()
@@ -3130,12 +3458,16 @@ console.log('\n--- worktree task notes survive navigation and can be searched --
   tree = await selectModule(tree, 'worktrees')
   findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
   tree = await flush(GitApp, { connection: mounted.rpc, t })
+  tree = await openWorktreeNote(tree)
   findAll(tree, 'textarea').find(node => node.props.name === 'worktreeNote').props.onChange({ target: { value: 'repair payment retry' } })
   tree = await flush(GitApp, { connection: mounted.rpc, t })
+  tree = await closeWorktreeNote(tree)
+  check('closing the note dialog keeps its draft without a permanent editor', !findAll(tree, 'textarea').some(node => node.props.name === 'worktreeNote') && hasText(tree, t('wt.unsavedNote')))
   const refreshCount = mounted.rpc.calls.filter(call => call.method === 'worktrees').length
   findAll(tree, 'button').find(node => textOf(node) === t('action.refresh')).props.onClick()
   tree = await flush(GitApp, { connection: mounted.rpc, t })
   check('refresh also guards an unsaved task note', hasText(tree, t('wt.noteLeave')) && mounted.rpc.calls.filter(call => call.method === 'worktrees').length === refreshCount)
+  tree = await closeWorktreeNote(tree)
   findAll(tree, 'button').find(node => node.props.role === 'option' && !hasText(node, taskRoot)).props.onClick()
   tree = await flush(GitApp, { connection: mounted.rpc, t })
   check('unsaved task notes guard worktree selection', hasText(tree, t('wt.noteLeave')) &&
@@ -3145,7 +3477,9 @@ console.log('\n--- worktree task notes survive navigation and can be searched --
   check('saving the task note completes the pending selection', findAll(tree, 'button').some(node => node.props.role === 'option' && node.props['aria-selected'] && !hasText(node, taskRoot)))
   findAll(tree, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
   tree = await flush(GitApp, { connection: mounted.rpc, t })
+  tree = await openWorktreeNote(tree)
   check('task notes persist when reopening worktree details', findAll(tree, 'textarea').find(node => node.props.name === 'worktreeNote').props.value === 'repair payment retry')
+  tree = await closeWorktreeNote(tree)
   findAll(tree, 'input').find(node => node.props['aria-label'] === t('wt.search')).props.onChange({ target: { value: 'payment retry' } })
   tree = await flush(GitApp, { connection: mounted.rpc, t })
   check('worktree search includes task notes without writing to Git', findAll(tree, 'button').filter(node => node.props.role === 'option').length === 1 &&
@@ -3163,7 +3497,7 @@ console.log('\n--- unsaved worktree notes survive native session remounts ---')
     let current = await renderApp(handlers)
     current = await selectModule(current, 'worktrees')
     findAll(current, 'button').find(node => node.props.role === 'option' && hasText(node, taskRoot)).props.onClick()
-    return flush(GitApp, { connection: mounted.rpc, t })
+    return openWorktreeNote(await flush(GitApp, { connection: mounted.rpc, t }))
   }
   tree = await reopen()
   findAll(tree, 'textarea').find(node => node.props.name === 'worktreeNote').props.onChange({ target: { value: 'draft across native sessions' } })
@@ -3172,6 +3506,7 @@ console.log('\n--- unsaved worktree notes survive native session remounts ---')
   tree = await reopen()
   check('native session remount restores the unsaved draft', findAll(tree, 'textarea').find(node => node.props.name === 'worktreeNote').props.value === 'draft across native sessions')
   check('restoring a draft keeps it unsaved', !findAll(tree, 'button').find(node => textOf(node) === t('wt.saveNote')).props.disabled && hasText(tree, t('wt.unsavedNote')))
+  tree = await closeWorktreeNote(tree)
   findAll(tree, 'button').find(node => node.props.role === 'option' && !hasText(node, taskRoot)).props.onClick()
   tree = await flush(GitApp, { connection: mounted.rpc, t })
   findAll(tree, 'button').find(node => textOf(node) === t('wt.discardContinue')).props.onClick()

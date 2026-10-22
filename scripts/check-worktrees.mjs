@@ -5,7 +5,7 @@ import { join, relative, isAbsolute } from 'node:path'
 import { git, resolveGitPath } from '../lib/git/exec.js'
 import { RepoRegistry } from '../lib/git/repo.js'
 import { parseWorktrees } from '../lib/git/parse.js'
-import { worktreeDetails, commonDirectory, worktreeManagementPreview } from '../lib/git/worktrees.js'
+import { worktreeDetails, commonDirectory, worktreeManagementPreview, worktreeCreatePreview, worktreeRemovalPreview } from '../lib/git/worktrees.js'
 import { addWorktree, removeWorktree, manageWorktree } from '../lib/git/write.js'
 import { createRpc } from '../lib/rpc.js'
 import { DEFAULT_CONFIG } from '../lib/config.js'
@@ -33,6 +33,29 @@ try {
   await run(['add', '.'])
   await run(['commit', '-m', 'initial'])
   const registry = new RepoRegistry({ gitPath }), { session: repo } = await registry.open(root)
+  const createRequest = { ref: 'HEAD~0', name: 'preflight-only', directory: join(temp, 'preflight-only') }
+  const beforeCreate = await worktreeCreatePreview(repo, createRequest)
+  assert.equal(beforeCreate.valid, true)
+  assert.equal(beforeCreate.head, await run(['rev-parse', 'HEAD']))
+  await assert.rejects(access(createRequest.directory), { code: 'ENOENT' })
+  assert.equal((await repo.worktrees()).length, 1)
+  const invalidCreate = await worktreeCreatePreview(repo, { ref: 'missing-reference', name: 'bad name', directory: 'relative' })
+  assert.deepEqual(Object.keys(invalidCreate.errors).sort(), ['directory', 'name', 'ref'])
+  assert.equal((await worktreeCreatePreview(repo, { ...createRequest, name: 'main' })).valid, false)
+  assert.match((await worktreeCreatePreview(repo, { ...createRequest, name: 'main/nested' })).errors.name, /冲突/)
+  await run(['branch', 'topic/nested'])
+  assert.match((await worktreeCreatePreview(repo, { ...createRequest, name: 'topic' })).errors.name, /冲突/)
+  await assert.rejects(addWorktree(repo, { ...createRequest, name: 'topic' }), /冲突/)
+  await assert.rejects(access(createRequest.directory), { code: 'ENOENT' })
+  await run(['branch', '-D', 'topic/nested'])
+  await run(['branch', createRequest.name])
+  await assert.rejects(addWorktree(repo, createRequest), /已存在/)
+  await assert.rejects(access(createRequest.directory), { code: 'ENOENT' })
+  await run(['branch', '-D', createRequest.name])
+  const alias = join(temp, 'main-alias')
+  await symlink(root, alias, process.platform === 'win32' ? 'junction' : 'dir')
+  assert.match((await worktreeCreatePreview(repo, { ...createRequest, directory: join(alias, 'nested') })).errors.directory, /之外/)
+  console.log('PASS creation preflight is read-only, reports field errors and rechecks conflicts before writing')
   assert.equal((await addWorktree(repo, { ref: 'HEAD', name: 'task', directory: other })).ok, true)
   let trees = await repo.worktrees(), tree = trees.find(item => item.branch === 'refs/heads/task')
   assert(tree && tree.path.includes('任务 空格'))
@@ -41,6 +64,10 @@ try {
   assert.equal(commonDirectory(repo), commonDirectory(linked))
   assert.notEqual(repo.identity.gitDir, linked.identity.gitDir)
   assert.equal((await worktreeDetails(repo, { directory: other })).counts.total, 0)
+  const cleanRemoval = await worktreeRemovalPreview(repo, { directory: other })
+  assert.equal(cleanRemoval.removable, true)
+  assert.equal(cleanRemoval.tree.branch, 'refs/heads/task')
+  assert.equal((await worktreeRemovalPreview(repo, { directory: root })).removable, false)
   console.log('PASS creation, Unicode paths, shared identity and independent Git directories')
 
   const guard = () => ({ directory: tree.path, expectedHead: tree.head, expectedBranch: tree.branch })
@@ -57,6 +84,10 @@ try {
   let detail = await worktreeDetails(repo, { directory: other })
   assert.equal(detail.counts.unstaged, 1)
   assert.equal(detail.counts.untracked, 1)
+  const dirtyRemoval = await worktreeRemovalPreview(repo, { directory: other })
+  assert.equal(dirtyRemoval.removable, false)
+  assert(dirtyRemoval.files.some(file => file.path === 'tracked.txt'))
+  assert(dirtyRemoval.files.some(file => file.path === 'untracked.txt' && file.kind === 'untracked'))
   await assert.rejects(removeWorktree(repo, guard()), /本地改动/)
   assert.equal(await readFile(join(other, 'untracked.txt'), 'utf8'), 'keep\n')
   await run(['add', 'tracked.txt'], other)
@@ -66,6 +97,11 @@ try {
   await mkdir(join(other, 'ignored'))
   await writeFile(join(other, 'ignored', 'secret'), 'keep ignored\n')
   assert.equal((await worktreeDetails(repo, { directory: other })).counts.ignored, 1)
+  const ignoredRemoval = await worktreeRemovalPreview(repo, { directory: other })
+  assert.equal(ignoredRemoval.removable, false)
+  assert(ignoredRemoval.blockers.some(blocker => blocker.kind === 'ignored'))
+  assert(ignoredRemoval.ignoredPaths.includes('ignored/'))
+  assert.equal(await readFile(join(other, 'ignored', 'secret'), 'utf8'), 'keep ignored\n')
   await assert.rejects(removeWorktree(repo, guard()), /忽略/)
   await rm(join(other, 'ignored', 'secret'))
   await rmdir(join(other, 'ignored'))
@@ -92,6 +128,8 @@ try {
   console.log('PASS NUL porcelain preserves newline paths and metadata')
 
   const rpc = createRpc({ registry, config: { get: () => ({ ...DEFAULT_CONFIG }) } })
+  assert.equal((await rpc.call('worktreeCreatePreview', { root, ...createRequest })).value.valid, true)
+  assert.equal((await rpc.call('worktreeRemovalPreview', { root, directory: other })).value.removable, true)
   assert.equal((await rpc.call('repos', { path: root })).value.repos[0].commonDir,
     (await rpc.call('repos', { path: other })).value.repos[0].commonDir)
   let response = await rpc.call('write.removeWorktree', { root, ...guard() })
