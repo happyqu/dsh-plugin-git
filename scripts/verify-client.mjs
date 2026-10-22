@@ -201,6 +201,12 @@ function healthyHandlers(overrides = {}) {
   return {
     repos: () => ({ gitPath: 'd:/Program Files/Git/cmd/git.exe', repos: [{ root: ROOT, version: 'git version 2.50.1.windows.1', features: {} }], config: CONFIG }),
     status: () => STATUS,
+    statusSummary: async payload => {
+      const status = await (overrides.status || (() => STATUS))(payload)
+      const tracking = await (overrides.branchTracking || (() => TRACKING))(payload)
+      return { branch: { ...status.branch, ahead: tracking.ahead, behind: tracking.behind }, total: status.total ?? status.files?.length ?? 0,
+        operation: status.operation, files: [], summary: true }
+    },
     changelists: () => ({ version: 1, mode: 'staging', fileLayout: 'flat', active: 'default', draftList: 'default', lists: [{ id: 'default', name: '默认', draft: '', expanded: true }], assignments: {}, selected: [], chunks: {} }),
     refs: () => REFS,
     stashes: () => [{ ref: 'stash@{0}', sha: '9'.repeat(40), message: 'On main: 临时改动：README 草稿', date: 1790740000 }],
@@ -1275,8 +1281,9 @@ check('no horizontal tab row is rendered',
 check('renders a status bar carrying the repository facts',
   walk(tree).some((node) => String(node.props?.className ?? '').includes('dshgit-statusbar')) &&
   hasText(walk(tree).find((node) => String(node.props?.className ?? '').includes('dshgit-statusbar')), 'main'))
-check('renders the blame column for the opened file',
-  hasText(tree, '张三'), textOf(tree).slice(0, 300))
+// A name previously arrived from eager repoMeta, not from a blame read.
+check('opening a file diff does not enumerate repository contributors',
+  !mounted.rpc.calls.some(call => call.method === 'contributors'))
 check('rendered diff rows carry +/- kinds',
   walk(tree).some((node) => node.$$kind === 'host' && node.props?.['data-kind'] === 'add'),
   'no add row found')
@@ -2440,27 +2447,22 @@ async function expandSection(tree, title, rootProps) {
 console.log('\n--- repository metadata and tracking are visible ---')
 {
   tree = await renderApp()
-  // Everything the left pane needs comes from specific RPC methods; a missing
-  // call here is a silently empty section in the UI.
-  for (const method of ['remotes', 'contributors', 'branchTracking', 'repoMeta']) {
+  // Only remote names are needed by the always-visible sync controls.
+  for (const method of ['remotes']) {
     check(`requested ${method}`, mounted.rpc.calls.some((call) => call.method === method),
       mounted.rpc.calls.map((c) => c.method).join(','))
   }
 
-  // Contributors/remotes/worktrees used to be collapsible sections in this left
-  // pane. That repo-tree is gone: `dshgit-sectionhead` survives only inside the
-  // stashes/settings panes, and the changes sidebar has no such sections. What
-  // remains true — and what these checks are really about — is that the client
-  // still ASKS the Host for this metadata, so nothing here silently empties.
   const rootProps = { connection: mounted.rpc, t }
-  check('the client still requests the repository metadata',
-    ['remotes', 'contributors', 'branchTracking', 'repoMeta'].every((method) =>
-      mounted.rpc.calls.some((call) => call.method === method)),
+  check('the changes module defers metadata belonging to other modules',
+    ['refs', 'contributors', 'branchTracking', 'repoMeta', 'worktrees', 'stashes'].every((method) =>
+      !mounted.rpc.calls.some((call) => call.method === method)),
     mounted.rpc.calls.map((c) => c.method).join(','))
 
   // The live branch list is the graph module's sidebar, which carries the upstream
   // divergence for each branch.
   tree = await selectModule(tree, 'graph')
+  check('the graph module loads its own refs, worktrees and repository metadata', ['refs', 'worktrees', 'repoMeta'].every(method => mounted.rpc.calls.some(call => call.method === method)))
   const branchItem = walk(tree).find((node) => String(node.props?.className ?? '') === 'dshgit-branch-item')
   check('the branch row shows upstream divergence',
     walk(tree).some((node) => String(node.props?.className ?? '').includes('dshgit-branch-tracking')),
@@ -2724,10 +2726,13 @@ console.log('\n--- tag clicks directly create a branch without detached checkout
 }
 {
   const detachedStatus = { ...STATUS, branch: { ...STATUS.branch, head: '(detached)', oid: 'c'.repeat(40), detached: true, upstream: null } }
-  const header = await renderChips(healthyHandlers({ status: () => detachedStatus,
+  let header = await renderChips(healthyHandlers({ status: () => detachedStatus,
     refs: () => ({ ...REFS, tags: [{ name: 'v0.1.0', ref: 'refs/tags/v0.1.0', sha: 'd'.repeat(40), commitSha: 'c'.repeat(40) }] }) }))
   const chip = findAll(header, 'button').find((node) => node.props['data-chip'] === 'branch')
-  check('detached header identifies annotated tag and detached state', hasText(chip, t('wb.detachedState', { name: 'v0.1.0' })))
+  check('detached header initially identifies HEAD without enumerating tags', hasText(chip, t('wb.detachedState', { name: 'c'.repeat(8) })) && !mounted.rpc.calls.some(call => call.method === 'refs'))
+  chip.props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) } })
+  header = await flush(GitApp, { connection: mounted.rpc, t: mounted.t })
+  check('detached header resolves annotated tag names when the picker opens', hasText(findAll(header, 'button').find(node => node.props['data-chip'] === 'branch'), t('wb.detachedState', { name: 'v0.1.0' })))
 }
 
 
@@ -3653,6 +3658,178 @@ console.log('\n--- an expired worktree snapshot can be regenerated ---')
   tree = await flush(GitApp, { connection: mounted.rpc, t })
   check('regeneration uses a new snapshot token and renders its content', generations === 2 && hasText(tree, 'regenerated content') &&
     !hasText(tree, t('wt.snapshotExpired')) && mounted.rpc.calls.some(call => call.method === 'worktreeCompareFile' && call.payload.token === 'generation-2'))
+}
+
+console.log('\n--- session startup and changes-first workbench loading ---')
+{
+  runCleanups()
+  const fixture = loadClientModule(source.replace('    return module.exports',
+    '    module.exports.HeaderGitCluster = HeaderGitCluster;\n    module.exports.GitApp = GitApp;\n    return module.exports'))
+  let idleId = 0
+  const idle = new Map()
+  window.requestIdleCallback = callback => { idle.set(++idleId, callback); return idleId }
+  window.cancelIdleCallback = id => idle.delete(id)
+  const runIdle = () => { const callbacks = [...idle.values()]; idle.clear(); callbacks.forEach(callback => callback()) }
+  const Header = fixture.HeaderGitCluster
+  const rpc = createRpcStub(healthyHandlers({ repositoryVersion: () => ({ generation: 'startup', version: 1, metadataVersion: 1, supported: true }) }))
+  const props = { connection: rpc, t, sessionId: 'startup-session', directory: ROOT }
+  mount(Header, props)
+  let view = await flush(Header, props)
+  check('session entry yields Git discovery until the browser is idle', !rpc.calls.some(call => ['repos', 'status', 'refs', 'changelists'].includes(call.method)))
+  runIdle(); view = await flush(Header, props)
+  const heavy = ['status', 'refs', 'branchTracking', 'changelists', 'worktrees', 'contributors']
+  check('idle header startup requests only a status summary and shows its change count', rpc.calls.some(call => call.method === 'statusSummary') &&
+    !rpc.calls.some(call => heavy.includes(call.method)) && textOf(findAll(view, 'button').find(node => node.props['data-chip'] === 'changes')) === '3')
+  await new Promise(resolve => setTimeout(resolve, 450))
+  view = await flush(Header, props)
+  check('header background polling also stays lightweight before interaction', !rpc.calls.some(call => heavy.includes(call.method)))
+  const clickHeader = async chip => {
+    findAll(view, 'button').find(node => node.props['data-chip'] === chip).props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) } })
+    view = await flush(Header, props)
+  }
+  await clickHeader('branch')
+  check('opening the branch picker loads refs without loading changelists', rpc.calls.some(call => call.method === 'refs') && !rpc.calls.some(call => call.method === 'changelists'))
+  await clickHeader('changes')
+  check('opening the changes popover loads file details and changelists on demand', rpc.calls.some(call => call.method === 'status') && rpc.calls.some(call => call.method === 'changelists') &&
+    walk(view).some(node => node.props?.title === 'src/index.js'), rpc.calls.map(call => call.method).join(',') + '\n' + textOf(view).slice(0, 350))
+  runCleanups()
+
+  const App = fixture.GitApp, root = 'D:/lazy-main-window'
+  let finishFull
+  const fullStatus = new Promise(resolve => { finishFull = resolve })
+  const mainRpc = createRpcStub(healthyHandlers({
+    repos: () => ({ gitPath: 'git', repos: [{ root }], config: CONFIG }),
+    repositoryVersion: () => ({ generation: 'main-window', version: 1, metadataVersion: 1, supported: true }),
+    status: payload => payload.details === false ? { ...STATUS, basic: true,
+      files: STATUS.files.map(file => { const { added, deleted, lfs, ...basic } = file; return basic }) } : fullStatus,
+  }))
+  const appProps = { connection: mainRpc, t, directory: root, sessionId: 'main-window', active: true }
+  mount(App, appProps)
+  view = await flush(App, appProps)
+  check('the main window first requests basic status and paints its file list', mainRpc.calls.some(call => call.method === 'status' && call.payload.details === false) && hasText(view, 'src/index.js'))
+  check('changes-first startup does not load other modules or full status', !mainRpc.calls.some(call =>
+    ['refs', 'stashes', 'worktrees', 'contributors', 'repoMeta', 'branchTracking'].includes(call.method) || (call.method === 'status' && call.payload.details !== false)))
+  runIdle(); view = await flush(App, appProps)
+  check('slow full-status enrichment leaves the basic file list usable', hasText(view, 'src/index.js') && mainRpc.calls.some(call => call.method === 'status' && call.payload.details !== false))
+  finishFull(STATUS); view = await flush(App, appProps)
+  activityItems(view).find(node => node.props['data-module'] === 'graph').props.onClick()
+  view = await flush(App, appProps)
+  check('switching to graph loads its metadata only then', ['refs', 'worktrees', 'repoMeta', 'commitGraph'].every(method => mainRpc.calls.some(call => call.method === method)))
+  activityItems(view).find(node => node.props['data-module'] === 'stashes').props.onClick()
+  view = await flush(App, appProps)
+  check('switching to stashes loads the stash list on demand', mainRpc.calls.some(call => call.method === 'stashes') && hasText(view, '临时改动'))
+  runCleanups()
+  const previousReads = mainRpc.calls.filter(call => call.method === 'status').length
+  mount(App, appProps); view = await flush(App, appProps)
+  check('reopening an unchanged repository reuses its warm full-status snapshot', hasText(view, 'src/index.js') && mainRpc.calls.filter(call => call.method === 'status').length === previousReads)
+  runCleanups()
+
+  const combinedRoot = 'D:/combined-main-window'
+  const combinedStatus = { ...STATUS, basic: true }
+  const combinedLists = healthyHandlers().changelists()
+  const combinedRpc = createRpcStub(healthyHandlers({
+    repositoryVersion: () => ({ generation: 'combined-window', version: 1, metadataVersion: 1, supported: true }),
+    repos: payload => ({ gitPath: 'git', repos: [{ root: combinedRoot }], config: CONFIG,
+      ...(payload.includeChanges ? { changes: { root: combinedRoot, status: combinedStatus, lists: combinedLists } } : {}) }),
+  }))
+  const combinedProps = { ...appProps, connection: combinedRpc, directory: combinedRoot }
+  mount(App, combinedProps)
+  view = await flush(App, combinedProps)
+  check('discovery delivers the initial changes list without sequential status and changelist RPCs',
+    hasText(view, 'src/index.js') && combinedRpc.calls.some(call => call.method === 'repos' && call.payload.includeChanges) &&
+    !combinedRpc.calls.some(call => ['status', 'changelists'].includes(call.method)))
+  runIdle(); view = await flush(App, combinedProps)
+  check('combined initial changes still enrich and reconcile after the first paint',
+    hasText(view, 'src/index.js') && combinedRpc.calls.some(call => call.method === 'status') && combinedRpc.calls.some(call => call.method === 'changelists'))
+  runCleanups()
+  const combinedReads = combinedRpc.calls.filter(call => call.method === 'status').length
+  mount(App, combinedProps); view = await flush(App, combinedProps)
+  check('combined startup preserves version-checked cache reuse when reopening the window',
+    hasText(view, 'src/index.js') && combinedRpc.calls.filter(call => call.method === 'status').length === combinedReads &&
+    combinedRpc.calls.filter(call => call.method === 'repos').at(-1).payload.includeChanges === false)
+  runCleanups()
+
+  const fallbackRpc = createRpcStub(healthyHandlers({ statusSummary: () => { const error = new Error('old Host'); error.code = 'git/unknown-method'; throw error } }))
+  const fallbackProps = { ...props, connection: fallbackRpc, directory: 'D:/older-host' }
+  mount(Header, fallbackProps); await flush(Header, fallbackProps); runIdle()
+  view = await flush(Header, fallbackProps)
+  check('an older Host falls back to status without breaking the header', fallbackRpc.calls.some(call => call.method === 'status') && hasText(view, 'main'))
+  runCleanups()
+}
+
+console.log('\n--- shared polling respects subscribers joining during a summary read ---')
+{
+  runCleanups()
+  const fixture = loadClientModule(source.replace('    return module.exports',
+    '    module.exports.HeaderGitCluster = HeaderGitCluster;\n    module.exports.GitApp = GitApp;\n    module.exports.useRepositoryUpdates = useRepositoryUpdates;\n    return module.exports'))
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
+  const within = promise => new Promise(resolve => {
+    const timer = setTimeout(() => resolve(false), 1500)
+    promise.then(() => { clearTimeout(timer); resolve(true) })
+  })
+  let version = 1, summaries = 0, releaseSummary, summaryStarted, fullStarted
+  const delayedSummary = new Promise(resolve => { releaseSummary = resolve })
+  const summaryPending = new Promise(resolve => { summaryStarted = resolve })
+  const fullPending = new Promise(resolve => { fullStarted = resolve })
+  const root = 'D:/summary-upgrade-race'
+  const summary = { ...STATUS, files: [], summary: true }
+  const laterFile = { ...STATUS.files[1], path: 'later.txt' }
+  const rpc = createRpcStub(healthyHandlers({
+    repos: () => ({ gitPath: 'git', repos: [{ root }], config: CONFIG }),
+    repositoryVersion: () => ({ generation: 'summary-race', version, supported: true }),
+    statusSummary: () => {
+      if (++summaries === 1) { version++; return summary }
+      summaryStarted(); return delayedSummary
+    },
+    status: payload => {
+      if (payload.details === false) return STATUS
+      fullStarted(); return { ...STATUS, total: STATUS.total + 1, files: STATUS.files.concat(laterFile) }
+    },
+  }))
+  const props = { connection: rpc, t, sessionId: 'summary-race', directory: root, active: true }
+  function RaceView(value) {
+    return [h(fixture.HeaderGitCluster, { ...props, key: 'header' }), value.open ? h(fixture.GitApp, { ...props, key: 'app' }) : null]
+  }
+  mount(RaceView, { open: false }); await flush(RaceView, { open: false })
+  check('race fixture holds a header summary response in flight', await within(summaryPending))
+  let view = await flush(RaceView, { open: true })
+  await pause(20); view = await flush(RaceView, { open: true })
+  const fileRow = (tree, path) => walk(tree).some(node => node.props?.title === path && String(node.props?.className || '').includes('dshgit-change'))
+  check('a workbench joining an in-flight summary displays its initial file list', fileRow(view, 'src/index.js'))
+  releaseSummary(summary)
+  await pause(20); view = await flush(RaceView, { open: true })
+  check('late summary responses cannot clear the workbench file list', fileRow(view, 'src/index.js'))
+  check('upgraded subscribers receive a full read without the error retry delay', await within(fullPending))
+  view = await flush(RaceView, { open: true })
+  check('the immediate full refresh preserves old rows and delivers newly changed files', fileRow(view, 'src/index.js') && fileRow(view, 'later.txt'))
+  runCleanups()
+
+  // Demand can also change during the debounce, before any status read starts.
+  let summaryReads = 0, fullReads = 0, sawVersion, sawFull
+  const versionRead = new Promise(resolve => { sawVersion = resolve })
+  const fullRead = new Promise(resolve => { sawFull = resolve })
+  const read = async method => {
+    if (method === 'config') return { autoFetch: false }
+    if (method === 'repositoryVersion') { sawVersion(); return { generation: 'debounce-race', version: 1, supported: true } }
+    if (method === 'statusSummary') { summaryReads++; return summary }
+    if (method === 'status') { fullReads++; sawFull(); return STATUS }
+  }
+  function Subscriber(value) {
+    fixture.useRepositoryUpdates('D:/debounce-upgrade-race', true, read, false, () => {}, null, { summary: value.summary, metadata: false })
+    return null
+  }
+  function DebounceView(value) {
+    return [h(Subscriber, { key: 'header', summary: true }), value.open ? h(Subscriber, { key: 'app', summary: false }) : null]
+  }
+  mount(DebounceView, { open: false }); await flush(DebounceView, { open: false }); await within(versionRead)
+  await flush(DebounceView, { open: true })
+  // The harness needs another commit to run effects of a newly added child
+  // whose render returns null and therefore causes no state update itself.
+  await flush(DebounceView, { open: true })
+  const refreshed = await within(fullRead)
+  check('subscribers joining during debounce upgrade the pending read before it is sent', refreshed && fullReads === 1 && summaryReads === 0,
+    JSON.stringify({ refreshed, fullReads, summaryReads }))
+  runCleanups()
 }
 
 console.log('\n--- header launchers restore their own repository after sidebar navigation ---')

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, relative, isAbsolute } from 'node:path'
 import { git, resolveGitPath } from '../lib/git/exec.js'
 import { RepoRegistry } from '../lib/git/repo.js'
+import { changelists } from '../lib/git/changelists.js'
 import { parseWorktrees } from '../lib/git/parse.js'
 import { worktreeDetails, commonDirectory, worktreeManagementPreview, worktreeCreatePreview, worktreeRemovalPreview } from '../lib/git/worktrees.js'
 import { addWorktree, removeWorktree, manageWorktree } from '../lib/git/write.js'
@@ -33,6 +34,88 @@ try {
   await run(['add', '.'])
   await run(['commit', '-m', 'initial'])
   const registry = new RepoRegistry({ gitPath }), { session: repo } = await registry.open(root)
+  // Header summaries and initial changelists must not fall through to full
+  // numstat / LFS decoration, which delays the first usable changes list.
+  const summaryRpc = createRpc({ registry, config: { get: () => DEFAULT_CONFIG } })
+  const observedCommands = [], originalRun = repo.run.bind(repo)
+  repo.run = async (args, options) => { observedCommands.push(args); return originalRun(args, options) }
+  try {
+    await writeFile(join(root, 'tracked.txt'), 'summary probe\n')
+    const summary = await summaryRpc.call('statusSummary', { root, force: true })
+    assert.equal(summary.ok, true)
+    assert.equal(summary.value.total, 1)
+    assert.equal(summary.value.branch.head, 'main')
+    assert.deepEqual(summary.value.files, [])
+    const lists = await summaryRpc.call('changelists', { root })
+    assert.equal(lists.ok, true)
+    assert(!observedCommands.some(args => args.includes('diff') || args.includes('check-attr') || args.includes('for-each-ref')))
+    const basic = await summaryRpc.call('status', { root, details: false })
+    assert.equal(basic.value.basic, true)
+    assert.equal(basic.value.files[0].path, 'tracked.txt')
+    assert.equal(basic.value.files[0].added, undefined)
+    assert(!observedCommands.some(args => args.includes('diff') || args.includes('check-attr')))
+    observedCommands.length = 0
+    const initial = await summaryRpc.call('repos', { path: root, includeChanges: true })
+    assert.equal(initial.ok, true)
+    assert.equal(initial.value.changes.status.files[0].path, 'tracked.txt')
+    assert.equal(initial.value.changes.status.basic, true)
+    assert.equal(initial.value.changes.lists.assignments['tracked.txt'], 'default')
+    assert.equal(observedCommands.filter(args => args[0] === 'status').length, 1)
+    assert(!observedCommands.some(args => args.includes('diff') || args.includes('check-attr')))
+    assert.equal((await summaryRpc.call('repos', { path: root })).value.changes, undefined)
+    const full = await summaryRpc.call('status', { root, force: true })
+    assert.equal(full.ok, true)
+    assert(observedCommands.some(args => args.includes('diff')))
+    assert(observedCommands.some(args => args.includes('check-attr')))
+    console.log('PASS summary, basic status and changelists defer numstat/LFS work until full status is requested')
+  } finally {
+    repo.run = originalRun
+    await writeFile(join(root, 'tracked.txt'), 'base\n')
+    repo.cache.invalidate()
+  }
+  // Hold an earlier edit in the per-repository queue while another window
+  // opens. Discovery must read status after that edit, not capture old paths
+  // outside the queue and later persist them over the new assignments.
+  {
+    const directory = join(temp, 'concurrent-lists'), metadata = join(directory, 'lists.json')
+    await mkdir(directory)
+    let currentFiles = [{ path: 'a.txt', kind: 'modified' }]
+    const concurrentRepo = { root: directory, gitPath,
+      run: async () => ({ code: 0, stdout: metadata }),
+      status: async () => ({ branch: { head: 'main' }, files: [...currentFiles], total: currentFiles.length }),
+    }
+    const initial = await changelists(concurrentRepo)
+    const readStatus = concurrentRepo.status
+    let releaseEdit, editStarted, statusReads = 0
+    const heldEdit = new Promise(resolve => { releaseEdit = resolve })
+    const pendingEdit = new Promise(resolve => { editStarted = resolve })
+    concurrentRepo.status = async () => {
+      if (++statusReads === 1) { editStarted(); await heldEdit }
+      return readStatus()
+    }
+    const edited = changelists(concurrentRepo, { action: 'create', name: 'Task B', paths: ['b.txt'], version: initial.version })
+    await pendingEdit
+    const concurrentRpc = createRpc({ registry: {
+      gitExecutable: async () => gitPath, open: async () => ({ session: concurrentRepo }),
+    }, config: { get: () => DEFAULT_CONFIG } })
+    const opening = concurrentRpc.call('repos', { path: directory, includeChanges: true })
+    try {
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(statusReads, 1, 'Startup must not capture status before the preceding list edit finishes')
+    } finally {
+      currentFiles = [...currentFiles, { path: 'b.txt', kind: 'modified' }]
+      releaseEdit()
+    }
+    const updated = await edited, snapshot = await opening
+    assert.equal(snapshot.ok, true)
+    const listId = updated.lists.find(list => list.name === 'Task B').id
+    assert.equal(snapshot.value.changes.lists.assignments['b.txt'], listId)
+    assert(snapshot.value.changes.lists.selected.includes('b.txt'))
+    assert(snapshot.value.changes.status.files.some(file => file.path === 'b.txt'))
+    assert.equal(statusReads, 2, 'Discovery reads status only once inside its transaction')
+    assert.equal(JSON.parse(await readFile(metadata, 'utf8')).assignments['b.txt'], listId)
+    console.log('PASS queued startup preserves concurrent changelist assignments and returns matching fresh status')
+  }
   const createRequest = { ref: 'HEAD~0', name: 'preflight-only', directory: join(temp, 'preflight-only') }
   const beforeCreate = await worktreeCreatePreview(repo, createRequest)
   assert.equal(beforeCreate.valid, true)
