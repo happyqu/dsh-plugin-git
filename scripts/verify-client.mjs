@@ -2986,6 +2986,87 @@ async function closeWorktreeNote(view) {
   return flush(GitApp, { connection: mounted.rpc, t })
 }
 
+console.log('\n--- large comboboxes render a window without truncating search or keyboard navigation ---')
+{
+  runCleanups()
+  const { ComboBox } = loadClientModule(source.replace('    return module.exports', '    module.exports.ComboBox = ComboBox;\n    return module.exports'))
+  const options = [{ value: 'HEAD', label: 'HEAD', group: '' }].concat(
+    Array.from({ length: 1000 }, (_, index) => ({ value: 'refs/heads/feature/' + String(index).padStart(4, '0'), label: 'feature/' + String(index).padStart(4, '0'), group: t('wb.local') })),
+    Array.from({ length: 1000 }, (_, index) => ({ value: 'refs/remotes/origin/feature/' + String(index).padStart(4, '0'), label: 'origin/feature/' + String(index).padStart(4, '0'), group: t('wb.remote') })),
+    Array.from({ length: 50 }, (_, index) => ({ value: 'refs/tags/release-' + index, label: 'release-' + index, group: t('wb.tags') })))
+  const choices = []
+  function ComboFixture(props) {
+    const [value, setValue] = React.useState(props.initialValue || 'HEAD')
+    return h(ComboBox, { ...props, t, value, label: 'Starting point', onChange: next => { choices.push(next); setValue(next) } })
+  }
+  let props = { options }
+  let view
+  const input = () => findAll(view, 'input').find(node => node.props.role === 'combobox')
+  const list = () => findAll(view, 'div').find(node => node.props.role === 'listbox')
+  const rows = () => findAll(view, 'button').filter(node => node.props.role === 'option')
+  const key = value => ({ key: value, preventDefault() {}, stopPropagation() {} })
+  const render = async () => { view = await flush(ComboFixture, props) }
+  const search = async value => { input().props.onChange({ currentTarget: { value } }); await render() }
+  mount(ComboFixture, props); await render()
+  input().props.onClick(); await render()
+  check('2051 references mount fewer than 24 options while retaining group headings', list().props['data-virtual'] && rows().length < 24 && hasText(view, t('wb.local')) &&
+    rows().every(row => row.props['aria-setsize'] === options.length))
+  const normalHeight = Number.parseFloat(rows()[0].props.style.height)
+  const headingHeight = Number.parseFloat(findAll(view, 'div').find(node => node.props.className === 'dshgit-combogroup').props.style.height)
+  list().props.onScroll({ currentTarget: { scrollTop: normalHeight * 1500 + headingHeight * 2 } }); await render()
+  check('scrolling reaches remote branches without snapping back to the active option', rows().some(row => row.props['data-value'].startsWith('refs/remotes/')) && rows().length < 24 &&
+    rows().some(row => row.props.id === input().props['aria-activedescendant']))
+  input().props.onKeyDown(key('ArrowUp')); await render()
+  check('arrow-key wrapping mounts and highlights the last tag beyond the visible window', rows().some(row => row.props['data-active'] === 'true' && row.props['data-value'] === 'refs/tags/release-49' && row.props['aria-posinset'] === options.length) &&
+    rows().some(row => row.props.id === input().props['aria-activedescendant'] && row.props['aria-label'].includes(t('wb.tags'))))
+  input().props.onKeyDown(key('Enter')); await render()
+  check('Enter selects the highlighted offscreen reference', choices.at(-1) === 'refs/tags/release-49' && !input().props['aria-expanded'])
+  input().props.onClick(); await render()
+  check('reopening a large list positions its selected reference in the rendered window', rows().some(row => row.props['aria-selected'] && row.props['data-active'] === 'true' && row.props['data-value'] === 'refs/tags/release-49'))
+  await search('origin/feature/0999')
+  check('search can find a remote reference beyond the first thousand options', rows().length === 1 && rows()[0].props['data-value'] === 'refs/remotes/origin/feature/0999' && !list().props['data-virtual'])
+  input().props.onKeyDown(key('Enter')); await render()
+  check('search selection preserves the canonical remote ref', choices.at(-1) === 'refs/remotes/origin/feature/0999')
+  input().props.onClick(); await render()
+  await search(t('wb.remote'))
+  check('searching a group includes every matching reference with bounded DOM size', list().props['data-virtual'] && rows().length < 24 && rows().every(row => row.props['aria-setsize'] === 1000 && row.props['data-value'].startsWith('refs/remotes/')))
+  await search('no-such-reference')
+  check('an empty search result clears stale virtual rows and active descendants', rows().length === 0 && !input().props['aria-activedescendant'] && hasText(view, t('combo.noMatch')))
+  await search('')
+  const computedStyle = globalThis.getComputedStyle
+  try {
+    globalThis.getComputedStyle = node => ({ ...computedStyle(node), fontSize: '22px' })
+    list().props.onScroll({ currentTarget: { scrollTop: 0 } }); await render()
+    const visible = rows().map(row => ({ top: Number.parseFloat(row.props.style.top), height: Number.parseFloat(row.props.style.height) })).sort((a, b) => a.top - b.top)
+    check('virtual row geometry follows larger text without overlapping options', visible[0].height > normalHeight && visible.every((row, index) => index === 0 || visible[index - 1].top + visible[index - 1].height <= row.top))
+    input().props.onKeyDown(key('ArrowUp')); await render()
+    input().props.onKeyDown(key('Enter')); await render()
+    check('keyboard selection remains correct after font scaling', choices.at(-1) === 'refs/tags/release-49')
+  } finally { globalThis.getComputedStyle = computedStyle }
+  runCleanups()
+  props = { options, allowCustom: true }
+  mount(ComboFixture, props); await render()
+  input().props.onClick(); await render()
+  await search('f'.repeat(40))
+  input().props.onKeyDown(key('Enter')); await render()
+  check('virtualized suggestions retain arbitrary commit SHA input', choices.at(-1) === 'f'.repeat(40) && input().props.value === 'f'.repeat(40))
+  input().props.onClick(); await render()
+  await search('HEAD~2')
+  input().props.onBlur(); await render()
+  check('revision expressions survive blurring the suggestion list', input().props.value === 'HEAD~2' && choices.at(-1) === 'HEAD~2')
+  runCleanups()
+  props = { options: options.slice(0, 80) }
+  mount(ComboFixture, props); await render()
+  input().props.onClick(); await render()
+  check('small dropdowns retain their complete ordinary list', !list().props['data-virtual'] && rows().length === 80)
+  runCleanups()
+  props = { options: Array.from({ length: 3000 }, (_, index) => ({ value: 'ref-' + index, label: 'ref-' + index, group: 'branch-' + index })), initialValue: 'ref-2999' }
+  mount(ComboFixture, props); await render()
+  input().props.onClick(); await render()
+  check('thousands of distinct groups keep the selected item reachable and DOM bounded', rows().length < 24 && rows().some(row => row.props['data-value'] === 'ref-2999' && row.props['data-active'] === 'true') && hasText(view, 'branch-2999'))
+  runCleanups()
+}
+
 console.log('\n--- worktree synchronization follows external edits and visibility ---')
 {
   runCleanups()
