@@ -384,6 +384,16 @@ check('the stylesheet contains theme tokens, not hard-coded colors',
   String(loaded.appendedStyles[0]?.textContent).slice(0, 120))
 check('an empty commit message keeps the primary button legible',
   String(loaded.appendedStyles[0]?.textContent).includes('.dshgit-btn.dshgit-commit-primary:disabled{opacity:1;'))
+// Git output has no length limit: a commit of a few thousand files used to hand
+// the toast one line per file. The toast text and a success banner therefore
+// clamp their height, so no message can cover the window.
+check('long git output is clamped in toasts and success banners', (() => {
+  const css = String(loaded.appendedStyles[0]?.textContent ?? '')
+  const toastText = /\.dshgit-toast-text\{[^}]*\}/.exec(css)?.[0] ?? ''
+  const noticeText = /\.dshgit-notice\[data-tone="success"\][^{]*\.dshgit-noticetext\{[^}]*\}/.exec(css)?.[0] ?? ''
+  return toastText.includes('-webkit-line-clamp') && toastText.includes('overflow:hidden') &&
+    noticeText.includes('-webkit-line-clamp') && noticeText.includes('overflow:hidden')
+})())
 // The commit control is a joined split button: the primary half and the chevron
 // half must share ONE fill. That fill is now a theme token
 // (`--dsw-alias-button-info-fill`, falling back to the brand primary) rather than
@@ -1197,6 +1207,11 @@ console.log('\n--- workbench Commit explains missing text and clears a mixed cha
       .map((call) => call.method)) === JSON.stringify(['write.commit']))
   check('the change rows clear after the commit',
     findWhere(full, (props) => props['data-change-group'] !== undefined).length === 0)
+  // The toast text is the element the stylesheet clamps, so a long write
+  // result (a big commit's git output) cannot stretch the banner.
+  const commitToastText = walk(full).find((node) => String(node.props?.className) === 'dshgit-toast-text')
+  check('the commit toast renders through the clamped text element',
+    commitToastText !== undefined && hasText(commitToastText, 'committed'), textOf(full).slice(-240))
   // The sidebar composer never turns into Sync: the full window has dedicated
   // Fetch/Pull/Push buttons in its title bar (`canSync` requires `!props.sidebar`).
   check('the sidebar composer does not become a Sync button',
@@ -3967,6 +3982,87 @@ console.log('\n--- header launchers restore their own repository after sidebar n
   context.effects.find(effect => effect?.label === 'git: sidebar workspace actions').result()
   check('plugin disposal removes sidebar actions and observers', disconnected && unsubscribed && rows.every(node => !gitButton(node)))
   globalThis.MutationObserver = previousObserver
+}
+
+// Exercise the real shortcut component and navigation guard from the bundle.
+{
+  const embedded = { path: 'embedded/', index: '?', worktree: '?', kind: 'untracked', nestedRepository: { root: ROOT + '/embedded' } }
+  for (const mode of ['staging', 'lists']) {
+    const defaults = healthyHandlers()
+    const fixtureRoot = ROOT + '/nested-' + mode
+    let tree = await renderApp(healthyHandlers({
+      repos: () => ({ ...defaults.repos(), repos: [{ ...defaults.repos().repos[0], root: fixtureRoot }] }),
+      status: () => ({ ...STATUS, files: [embedded], total: 1 }),
+      changelists: () => ({ ...defaults.changelists(), mode, fileLayout: 'tree' }),
+    }))
+    tree = await selectModule(tree, 'changes')
+    check('nested repository shortcuts appear in the ' + mode + ' workbench',
+      findWhere(tree, props => props['data-nested-repository'] === embedded.path).length > 0, textOf(tree).slice(-1200))
+    check('nested directory rows do not create an extra tree level in ' + mode,
+      findWhere(tree, props => props['data-file-path'] === embedded.path).length === 1 &&
+      findWhere(tree, props => props['data-folder-path'] === 'embedded').length === 0)
+  }
+  const nestedClient = loadClientModule(source.replace('    return module.exports',
+    '    Object.assign(module.exports, { NestedRepositories, HeaderGitCluster, getWindowState, setWindowState, registerNavigationGuard });\n    return module.exports'))
+  // The resident header can belong to A while the global workbench belongs to B.
+  // Verify both commit modes use A when launching its embedded repository.
+  for (const mode of ['staging', 'lists']) {
+    runCleanups()
+    const defaults = healthyHandlers()
+    const rpc = createRpcStub(healthyHandlers({
+      status: () => ({ ...STATUS, files: [embedded], total: 1 }),
+      changelists: () => ({ ...defaults.changelists(), mode }),
+    }))
+    const context = createClientContext({ connection: rpc })
+    nestedClient.apply(context.ctx)
+    const headerProps = { connection: rpc, t, sessionId: 'nested-session-A', directory: ROOT }
+    mount(nestedClient.HeaderGitCluster, headerProps)
+    let header = await flush(nestedClient.HeaderGitCluster, headerProps)
+    nestedClient.setWindowState({ mode: 'full', sessionId: 'nested-session-B', directory: 'D:/other-workspace', workspace: 'D:/other-workspace' })
+    header = await flush(nestedClient.HeaderGitCluster, headerProps)
+    findAll(header, 'button').find(node => node.props['data-chip'] === 'changes').props.onClick({
+      currentTarget: { getBoundingClientRect: () => ({ right: 420, bottom: 40 }) },
+    })
+    header = await flush(nestedClient.HeaderGitCluster, headerProps)
+    findAll(header, 'button').find(node => textOf(node) === t('nested.open')).props.onClick()
+    const state = nestedClient.getWindowState()
+    check('nested header shortcut preserves its own session after another workspace opened in ' + mode,
+      state.sessionId === headerProps.sessionId && state.directory === embedded.nestedRepository.root)
+  }
+  runCleanups()
+  nestedClient.setWindowState({ sessionId: 'unrelated-session', directory: 'D:/other-workspace' })
+  const calls = [], after = () => {}
+  const file = { path: 'embedded/', kind: 'untracked', nestedRepository: { root: ROOT + '/embedded' } }
+  const props = { status: { files: [file] }, t, afterWrite: after, sessionId: 'workbench-owner-session',
+    onWrite: (...args) => calls.push(args) }
+  const Component = nestedClient.NestedRepositories
+  let tree = mount(Component, props).tree
+  check('embedded repositories expose open, local ignore and shared ignore shortcuts',
+    findAll(tree, 'button').length === 3 && hasText(tree, t('nested.title')))
+  findAll(tree, 'button').find(node => textOf(node) === t('action.ignoreLocal')).props.onClick()
+  check('nested local ignore targets the exact directory and refreshes the parent',
+    calls[0]?.[0] === 'ignoreLocalPath' && calls[0][1].path === file.path && calls[0][2].after === after)
+  findAll(tree, 'button').find(node => textOf(node) === t('action.ignoreFile')).props.onClick()
+  check('nested shared ignore uses the existing gitignore operation', calls[1]?.[0] === 'ignorePath' && calls[1][1].path === file.path)
+  const open = findAll(tree, 'button').find(node => textOf(node) === t('nested.open'))
+  const before = nestedClient.getWindowState().directory
+  const removeGuard = nestedClient.registerNavigationGuard(() => false)
+  open.props.onClick()
+  check('opening an embedded repository respects unsaved editor navigation guards', nestedClient.getWindowState().directory === before)
+  removeGuard()
+  open.props.onClick()
+  const state = nestedClient.getWindowState()
+  check('open repository launches the nested root in the changes workbench',
+    state.directory === file.nestedRepository.root && state.workspace === file.nestedRepository.root && state.tab === 'changes' && state.mode === 'full')
+  check('nested workbench shortcut preserves its explicit session instead of the global session', state.sessionId === props.sessionId)
+  nestedClient.setWindowState({ sessionId: 'unrelated-session', directory: 'D:/other-workspace' })
+  tree = mount(Component, { ...props, sessionId: '' }).tree
+  findAll(tree, 'button').find(node => textOf(node) === t('nested.open')).props.onClick()
+  check('workspace-only nested shortcuts keep an empty session instead of inheriting another conversation', nestedClient.getWindowState().sessionId === '')
+  tree = mount(Component, { ...props, busy: true }).tree
+  check('nested shortcuts are disabled during a write operation', findAll(tree, 'button').every(node => node.props.disabled))
+  tree = mount(Component, { ...props, status: { files: [{ path: 'ordinary.txt', kind: 'untracked' }] } }).tree
+  check('ordinary untracked files do not produce a repository notice', findAll(tree, 'button').length === 0 && !hasText(tree, t('nested.title')))
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`)

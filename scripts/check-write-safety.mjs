@@ -1,6 +1,6 @@
 /** Regression checks for write scope and push confirmation, using local Git only. */
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, access } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { git, resolveGitPath } from '../lib/git/exec.js'
@@ -77,4 +77,49 @@ await run(['tag', 'review-v1'])
 assert.equal((await rpc.call('write.push', { root, remote: 'origin', branch: 'refs/tags/review-v1' })).ok, true)
 assert.equal(await run(['--git-dir=' + remote, 'rev-parse', 'refs/tags/review-v1'], base), replacement)
 console.log('PASS push rejects force/deletion/option refspecs and retains confirmation and lease protection')
+
+// Embedded repositories are VCS roots, never ordinary discard targets. Exercise
+// both .git directories and .git files (linked worktrees), and a mixed selection.
+const nested = join(root, 'embedded'), linked = join(root, 'linked')
+await mkdir(nested)
+await run(['init', '-b', 'main'], nested)
+await writeFile(join(nested, 'keep.txt'), 'nested work\n')
+await run(['worktree', 'add', '-b', 'linked', linked])
+await writeFile(join(linked, 'keep.txt'), 'linked work\n')
+await mkdir(join(root, 'ordinary'))
+await writeFile(join(root, 'ordinary', 'discard.txt'), 'ordinary work\n')
+const trackedBefore = await readFile(join(root, 'outside.txt'), 'utf8')
+await writeFile(join(root, 'outside.txt'), 'discard tracked work\n')
+for (const details of [false, true]) {
+  const status = await repo.status({ force: true, details })
+  for (const name of ['embedded', 'linked']) {
+    const file = status.files.find(file => file.path === name + '/')
+    assert.equal(file?.nestedRepository?.root, join(root, name))
+  }
+  assert.equal(status.files.find(file => file.path === 'ordinary/discard.txt')?.nestedRepository, undefined)
+}
+const discarded = await rpc.call('write.discardPaths', { root, confirm: true,
+  paths: ['embedded/', 'linked/', 'ordinary/discard.txt', 'outside.txt'],
+  untrackedPaths: ['embedded/', 'linked/', 'ordinary/discard.txt'] })
+assert.equal(discarded.ok, false)
+assert.equal(discarded.error.code, 'git/nested-repository')
+assert.equal(discarded.error.details.nestedRepositories.length, 2)
+assert.match(discarded.error.message, /已丢弃 2 个文件/)
+assert.match(discarded.error.message, /独立 Git 仓库，已保留/)
+await assert.rejects(access(join(root, 'ordinary', 'discard.txt')), { code: 'ENOENT' })
+assert.equal(await readFile(join(root, 'outside.txt'), 'utf8'), trackedBefore)
+assert.equal(await readFile(join(nested, 'keep.txt'), 'utf8'), 'nested work\n')
+assert.equal(await readFile(join(linked, 'keep.txt'), 'utf8'), 'linked work\n')
+await access(join(nested, '.git'))
+await access(join(linked, '.git'))
+assert.equal((await rpc.call('write.ignoreLocalPath', { root, path: 'embedded/' })).ok, true)
+assert.match(await readFile(join(root, '.git', 'info', 'exclude'), 'utf8'), /\/embedded\//)
+assert.equal((await repo.status({ force: true })).files.some(file => file.path === 'embedded/'), false)
+await assert.rejects(access(join(root, '.gitignore')), { code: 'ENOENT' })
+assert.equal((await rpc.call('write.ignorePath', { root, path: 'linked/' })).ok, true)
+assert.match(await readFile(join(root, '.gitignore'), 'utf8'), /\/linked\//)
+assert.equal((await repo.status({ force: true })).files.some(file => file.path === 'linked/'), false)
+assert.equal(await readFile(join(nested, 'keep.txt'), 'utf8'), 'nested work\n')
+assert.equal(await readFile(join(linked, 'keep.txt'), 'utf8'), 'linked work\n')
+console.log('PASS nested repositories and linked worktrees survive mixed discards; local and shared ignore preserve content')
 console.log('Write safety checks passed; fixture: ' + base)

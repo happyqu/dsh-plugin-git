@@ -58,6 +58,19 @@ report.timings.fullWorktreeCommitMs = Date.now() - start
 report.timings.contentScans = result.commitDiagnostics.refreshScans
 check('full worktree preserves index cache and outside staging')
 
+// A large commit must not hand the UI one line per file: `git commit` prints a
+// `create mode` line for every created file, and the success toast used to show
+// all of them, growing taller than the window. The message keeps the commit
+// header and the change totals; the raw per-file lines stay in stdout.
+const bulk = Array.from({ length: 400 }, (_, index) => 'files/bulk-' + index + '.txt')
+await Promise.all(bulk.map(path => writeFile(join(root, path), 'bulk\n')))
+result = await commitPaths(repo, { paths: bulk, message: 'bulk files' })
+assert.equal(result.ok, true, result.message)
+assert.equal(result.message.trim().split('\n').length, 2, 'Commit message keeps only the header and totals')
+assert.doesNotMatch(result.message, /create mode/)
+assert.match(result.stdout, /create mode 100644 files\/bulk-0\.txt/)
+check('a large commit reports a short message and keeps per-file output in stdout')
+
 const partial = 'files/5.txt', staged = lines.slice()
 staged[38] = 'outside staged hunk'
 await writeFile(join(root, partial), staged.join('\n') + '\n'); await run(['add', partial])

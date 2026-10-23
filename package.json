@@ -13,14 +13,11 @@
   },
   "files": [
     "lib",
-    "docs",
+    "dist/client.js",
     "cordis.patch.yml",
     "README.md",
-    "scripts/check-package.mjs",
-    "scripts/check-commit.mjs",
-    "scripts/check-ai-context.mjs",
-    "dist/client.js",
-    "scripts/build-client.mjs"
+    "docs",
+    "!docs/internal"
   ],
   "keywords": [
     "dsh",
