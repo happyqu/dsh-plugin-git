@@ -1225,10 +1225,10 @@ check('renders without throwing', tree !== null)
 check('shows the panel title', hasText(tree, 'Git'), textOf(tree).slice(0, 160))
 check('shows the resolved repository root', hasText(tree, ROOT), textOf(tree).slice(0, 200))
 check('shows the branch badge', hasText(tree, 'main'))
-// The file list has a staged/unstaged/all filter and DEFAULTS to "unstaged", so
-// the staged file is intentionally absent until "All" is chosen. Selecting it is
-// what a user does to see every change, and it keeps the row assertions below
-// covering the staged row as well.
+// The file list carries a staged/unstaged/all filter and DEFAULTS to "all", so
+// every change — the staged rows included — is on screen without a click. The
+// clicks below stay as idempotent guards: they now confirm the filter control
+// exists and holds its default rather than repairing a hidden selection.
 check('lists the staged file once the file filter shows everything', (() => {
   const all = findAll(tree, 'button').find((node) => String(node.props.className).includes('dshgit-btn') &&
     textOf(node).startsWith(t('batch.all') + ' '))
@@ -1436,6 +1436,71 @@ console.log('\n--- file context menu ---')
     mounted.rpc.calls.some((call) => call.method === 'write.stage' &&
       JSON.stringify(call.payload.paths) === JSON.stringify(['untracked.txt'])),
     JSON.stringify(mounted.rpc.calls.filter((call) => call.method === 'write.stage').map((call) => call.payload)))
+  tree = await renderApp()
+}
+
+console.log('\n--- staged changes stay reviewable in the commit popover ---')
+{
+  // A repository where every change is already staged. With the file filter
+  // defaulting to "unstaged" this was the worst case in the product: the list
+  // went EMPTY, so there was no row left to click for a diff, and the primary
+  // button disabled itself over a commit scope that still existed on disk.
+  const stagedOnly = { ...STATUS, total: 2, files: [
+    { path: 'docs/待提交.md', originalPath: null, index: 'A', worktree: '.', staged: true, kind: 'added', added: 3, deleted: 0, binary: false },
+    { path: 'src/index.js', originalPath: null, index: 'M', worktree: '.', staged: true, kind: 'ordinary', added: 2, deleted: 1, binary: false },
+  ] }
+  tree = await renderChips(healthyHandlers({ status: () => stagedOnly }))
+  findAll(tree, 'button').find((node) => node.props['data-chip'] === 'changes')
+    .props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 900, bottom: 40 }) } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const popover = () => walk(tree).find((node) => node.props?.['data-popover'] === 'commit')
+  const listed = walk(popover()).filter((node) => node.props?.['data-file-path']).map((node) => node.props['data-file-path'])
+  check('the file filter opens on All so staged rows are not hidden',
+    listed.includes('src/index.js') && listed.includes('docs/待提交.md'), JSON.stringify(listed))
+  const commitButton = findAll(popover(), 'button').find((node) =>
+    String(node.props.className).includes('dshgit-commit-primary'))
+  check('staged-only changes keep the commit button live', commitButton.props.disabled !== true,
+    textOf(commitButton))
+  // The row IS the way into the diff, so it must reach the viewer rather than
+  // silently select nothing.
+  const row = walk(popover()).find((node) => node.props?.['data-file-path'] === 'src/index.js')
+  row.props.onClick({})
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('clicking a staged row opens its diff',
+    walk(tree).some((node) => node.props?.['data-file-viewer'] === 'src/index.js') &&
+      mounted.rpc.calls.some((call) => call.method === 'diff' && call.payload.path === 'src/index.js'),
+    JSON.stringify(mounted.rpc.calls.filter((call) => call.method === 'diff').map((call) => call.payload)))
+
+  // The filter narrows the LIST, never the scope. Picking "已暂存" while an
+  // unstaged file exists used to grey the button out over changes still on
+  // disk, and picking "未暂存" flipped the label to "暂存并提交全部" while a
+  // staged scope existed. git decides both, from the whole working state.
+  tree = await renderChips(healthyHandlers({ status: () => stagedOnly }))
+  findAll(tree, 'button').find((node) => node.props['data-chip'] === 'changes')
+    .props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 900, bottom: 40 }) } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const mixedPopover = () => walk(tree).find((node) => node.props?.['data-popover'] === 'commit')
+  const pickFilter = async (label) => {
+    const button = findAll(mixedPopover(), 'button').find((node) => String(node.props.className).includes('dshgit-btn') &&
+      textOf(node).startsWith(t(label) + ' '))
+    if (button === undefined) return false
+    button.props.onClick()
+    tree = await flush(GitApp, { connection: mounted.rpc, t })
+    return true
+  }
+  const labelOf = () => textOf(findAll(mixedPopover(), 'button').find((node) =>
+    String(node.props.className).includes('dshgit-commit-primary')))
+  const disabledOf = () => findAll(mixedPopover(), 'button').find((node) =>
+    String(node.props.className).includes('dshgit-commit-primary')).props.disabled
+  const stagedLabel = labelOf()
+  check('narrowing the filter does not change the commit action',
+    (await pickFilter('batch.staged')) && labelOf() === stagedLabel && disabledOf() !== true,
+    `${stagedLabel} / ${labelOf()} / ${disabledOf()}`)
+  check('the staged count beside the button ignores the filter',
+    textOf(mixedPopover()).includes(t('window.staged', { count: 2 })), textOf(mixedPopover()).slice(0, 200))
+  check('a filter that hides every row says no matches, not no changes',
+    (await pickFilter('batch.unstaged')) && textOf(mixedPopover()).includes(t('list.noMatches')) &&
+      !textOf(mixedPopover()).includes(t('commit.nothing')), textOf(mixedPopover()).slice(0, 220))
   tree = await renderApp()
 }
 
@@ -2155,8 +2220,8 @@ console.log('\n--- basic git operations are reachable from the UI ---')
   // than to the removed repo-tree section. The `dshgit-sectioncount` badge is not
   // used there (counts render inside the group head), so assert the group ids and
   // the batch action order, which IS what the component guarantees.
-  // The file filter defaults to "unstaged", which hides the staged group — pick
-  // "All" so both group headers render (the filter drives the change groups too).
+  // The filter drives the change groups too. It now defaults to "All", so this
+  // click only pins the state the groups below are asserted against.
   const allFilter = findAll(tree, 'button').find((node) => String(node.props.className).includes('dshgit-btn') &&
     textOf(node).startsWith(t('batch.all') + ' '))
   if (allFilter !== undefined) {
@@ -2234,8 +2299,7 @@ console.log('\n--- a destroy shortcut asks before discarding (never writes first
 console.log('\n--- change groups collapse and scope their batch actions ---')
 {
   tree = await renderApp()
-  // Same reason as above: the default "unstaged" filter hides the staged group, so
-  // pick "All" before looking for it.
+  // Same reason as above: pin the filter to "All" before looking for the groups.
   const allFilter = findAll(tree, 'button').find((node) => String(node.props.className).includes('dshgit-btn') &&
     textOf(node).startsWith(t('batch.all') + ' '))
   if (allFilter !== undefined) { allFilter.props.onClick(); tree = await flush(GitApp, { connection: mounted.rpc, t }) }
