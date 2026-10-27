@@ -1504,6 +1504,65 @@ console.log('\n--- staged changes stay reviewable in the commit popover ---')
   tree = await renderApp()
 }
 
+console.log('\n--- a running commit does not freeze the file list ---')
+{
+  // The row click is a READ: it opens the diff viewer. While the commit was in
+  // flight the whole picker was dead — no error, no hint — which is exactly the
+  // moment a user wants to re-check what they are landing. A slow or hung commit
+  // (hooks, credentials) made the panel look broken.
+  // A repository with one staged file (the commit scope) and one unstaged file
+  // (the row to read). Clicking the unstaged one is what reaches the viewer's
+  // footer stage control, which is the write that must not look live.
+  const stagedFile = { ...STATUS.files[0] }
+  const unstagedFile = { ...STATUS.files[1] }
+  let releaseCommit
+  tree = await renderChips(healthyHandlers({
+    status: () => ({ ...STATUS, total: 2, files: [stagedFile, unstagedFile] }),
+    branchTracking: () => ({ ref: 'main', upstream: 'origin/main', ahead: 0, behind: 0 }),
+    'write.commit': () => new Promise((resolve) => { releaseCommit = resolve }),
+  }))
+  findAll(tree, 'button').find((node) => node.props['data-chip'] === 'changes')
+    .props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 900, bottom: 40 }) } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const popover = () => walk(tree).find((node) => node.props?.['data-popover'] === 'commit')
+  findAll(popover(), 'textarea').find((node) => node.props.placeholder === t('commit.placeholderMessage'))
+    .props.onChange({ currentTarget: { value: 'feat: keep reading' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(popover(), 'button').find((node) => String(node.props.className).includes('dshgit-commit-primary')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const busyButton = findAll(tree, 'button').find((node) => String(node.props.className).includes('dshgit-commit-primary'))
+  check('the commit is in flight and the button is busy',
+    mounted.rpc.calls.some((call) => call.method === 'operationStart' || call.method === 'write.commit') &&
+      busyButton !== undefined && (busyButton.props['aria-busy'] === true || busyButton.props.disabled === true),
+    JSON.stringify({ busy: busyButton?.props?.['aria-busy'], disabled: busyButton?.props?.disabled }))
+  const row = walk(tree).find((node) => node.props?.['data-file-path'] === unstagedFile.path)
+  check('the changed file is still listed while committing', row !== undefined)
+  row.props.onClick({})
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('clicking a row during the commit opens its diff',
+    walk(tree).some((node) => node.props?.['data-file-viewer'] === unstagedFile.path) &&
+      mounted.rpc.calls.some((call) => call.method === 'diff' && call.payload.path === unstagedFile.path),
+    JSON.stringify(walk(tree).filter((n) => n.props?.['data-file-viewer']).map((n) => n.props['data-file-viewer'])))
+  // The viewer is now reachable mid-write, so its one WRITE control must say so:
+  // `write()` refuses a second write in silence, and a live-looking button that
+  // does nothing is the exact failure the row fix was about.
+  const viewerNode = walk(tree).find((node) => node.props?.['data-file-viewer'] === unstagedFile.path)
+  const stageInViewer = findAll(viewerNode, 'button').find((node) => textOf(node) === t('action.stage'))
+  check('the viewer keeps its reads live and disables its write',
+    // `src/index.js` is the second of the two listed files, so paging BACK is a
+    // live read while the commit runs; the footer stage is the one write.
+    findAll(viewerNode, 'button').some((node) => node.props['aria-label'] === t('action.previousFile') &&
+      node.props.disabled === false) &&
+      stageInViewer !== undefined && stageInViewer.props.disabled === true &&
+      stageInViewer.props.title === t('state.busy'),
+    JSON.stringify(stageInViewer && { disabled: stageInViewer.props.disabled, title: stageInViewer.props.title }))
+  releaseCommit({ ok: true, code: 0, message: '提交成功', stdout: '' })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('the finished commit still reports through the banner',
+    walk(tree).some((node) => String(node.props?.className ?? '').includes('dshgit-notice')), textOf(tree).slice(-200))
+  tree = await renderApp()
+}
+
 console.log('\n--- history tab ---')
 {
   const rootProps = { connection: mounted.rpc, t }
