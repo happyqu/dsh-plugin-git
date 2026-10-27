@@ -1537,6 +1537,61 @@ console.log('\n--- a running commit does not freeze the file list ---')
     JSON.stringify({ busy: busyButton?.props?.['aria-busy'], disabled: busyButton?.props?.disabled }))
   const row = walk(tree).find((node) => node.props?.['data-file-path'] === unstagedFile.path)
   check('the changed file is still listed while committing', row !== undefined)
+
+  // Opening a file is a read; every WRITE must still be unreachable. Asserted on
+  // the controls themselves rather than on the row gate that was removed, so the
+  // two cannot drift apart later. Done before the viewer opens, because opening a
+  // file closes the popover behind it.
+  const writeRows = walk(popover()).filter((node) => node.props?.['data-file-path'])
+  const rowWrites = writeRows.flatMap((node) => findAll(node, 'button').filter((b) => b.props['data-file-action']))
+  check('every per-file write control is disabled while the commit runs',
+    rowWrites.length > 0 && rowWrites.every((node) => node.props.disabled === true),
+    JSON.stringify(rowWrites.map((node) => ({ action: node.props['data-file-action'], disabled: node.props.disabled }))))
+  const groupWrites = findAll(popover(), 'button').filter((node) => node.props['data-group-action'] && node.props['data-group-action'] !== 'view')
+  check('the group batch actions are disabled while the commit runs',
+    groupWrites.length > 0 && groupWrites.every((node) => node.props.disabled === true),
+    JSON.stringify(groupWrites.map((node) => ({ action: node.props['data-group-action'], disabled: node.props.disabled }))))
+  const scopeChecks = findAll(popover(), 'input').filter((node) => String(node.props.className).includes('dshgit-cl-checkbox'))
+  check('scope checkboxes cannot retarget the running commit',
+    scopeChecks.length === 0 || scopeChecks.every((node) => node.props.disabled === true),
+    JSON.stringify(scopeChecks.map((node) => node.props.disabled)))
+  const composerWrites = findAll(popover(), 'button').filter((node) =>
+    String(node.props.className).includes('dshgit-commit-ai') || String(node.props.className).includes('dshgit-commit-primary'))
+  check('the composer cannot start a second commit or generation',
+    composerWrites.length > 0 && composerWrites.every((node) => node.props.disabled === true),
+    JSON.stringify(composerWrites.map((node) => node.props.disabled)))
+
+  // The right-click menu: reading stays, writing goes.
+  writeRows[0].props.onContextMenu({ preventDefault() {}, stopPropagation() {}, clientX: 20, clientY: 30, currentTarget: { getBoundingClientRect: () => ({ left: 20, bottom: 50 }) } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const fileMenu = walk(tree).find((node) => node.props?.className === 'dshgit-contextmenu')
+  const menuLabel = (node) => {
+    const code = walk(node).find((c) => String(c.props?.className ?? '') === 'dshgit-menucommand')
+    const full = textOf(node)
+    return code ? full.replace(textOf(code), '').trim() : full
+  }
+  const menuWrites = findAll(fileMenu ?? {}, 'button').filter((node) =>
+    [t('action.stage'), t('action.unstage'), t('action.discard'), t('action.stashFile'), t('action.ignoreLocal'), t('action.ignoreFile')].includes(menuLabel(node)))
+  check('the file menu disables every write it offers',
+    menuWrites.length > 0 && menuWrites.every((node) => node.props.disabled === true),
+    JSON.stringify(menuWrites.map((node) => ({ label: menuLabel(node), disabled: node.props.disabled }))))
+  const menuReads = findAll(fileMenu ?? {}, 'button').filter((node) => [t('action.openChanges'), t('action.fileHistory')].includes(menuLabel(node)))
+  check('the file menu keeps its read entries live',
+    menuReads.length > 0 && menuReads.every((node) => !node.props.disabled),
+    JSON.stringify(menuReads.map((node) => ({ label: menuLabel(node), disabled: node.props.disabled }))))
+
+  // The last line of defence: even a control invoked programmatically (an
+  // assistive tool, a synthetic click) must not start a second write, because
+  // the write layer itself refuses while one is in flight.
+  const writesBefore = mounted.rpc.calls.filter((call) => call.method.startsWith('write.')).length
+  const forcedDiscard = rowWrites.find((node) => node.props['data-file-action'] === 'discard')
+  forcedDiscard.props.onClick({ stopPropagation() {} })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('a forced discard during the running commit writes nothing and asks nothing',
+    mounted.rpc.calls.filter((call) => call.method.startsWith('write.')).length === writesBefore &&
+      !walk(tree).some((node) => String(node.props?.className ?? '').includes('dshgit-confirmbar')),
+    JSON.stringify(mounted.rpc.calls.filter((call) => call.method.startsWith('write.')).map((call) => call.method)))
+
   row.props.onClick({})
   tree = await flush(GitApp, { connection: mounted.rpc, t })
   check('clicking a row during the commit opens its diff',
