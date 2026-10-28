@@ -1261,6 +1261,37 @@ check('change rows split the filename from its directory',
 // toolbar renders inline.
 check('change rows keep the status inside the row',
   walk(changeRow).some((node) => String(node.props?.className ?? '') === 'dshgit-status'))
+// The letter is coloured by a `data-status` attribute on the span itself, so the
+// stylesheet can pick one of four tones without every render site choosing a
+// colour class. A row-level attribute alone would not be enough: the compact
+// popover and the changelist pane swap the span out for a shared component.
+check('the status letter carries its own status code',
+  walk(changeRow).some((node) => String(node.props?.className ?? '') === 'dshgit-status' &&
+    node.props?.['data-status'] === 'M'),
+  JSON.stringify(walk(changeRow).filter((node) => String(node.props?.className ?? '') === 'dshgit-status')
+    .map((node) => node.props?.['data-status'])))
+// Editors colour the change-list letter: amber modified, green added/untracked,
+// red deleted. The colour is a second, faster cue than the one-character label —
+// but it is only worth having if it is keyed off the status and not off the
+// browser default.
+{
+  const css = String(loaded.appendedStyles[0]?.textContent ?? '')
+  check('each status tone is keyed off the status code',
+    css.includes('.dshgit-status[data-status="M"]') &&
+    css.includes('.dshgit-status[data-status="U"]') &&
+    css.includes('.dshgit-status[data-status="D"]'),
+    css.slice(css.indexOf('.dshgit-status[data-status'), css.indexOf('.dshgit-status[data-status') + 200))
+  check('the modified tone is its own token, not the success tone',
+    css.includes('--dshgit-modified-text:') && /--dshgit-modified-text:[^;]*state-warn-primary/.test(css),
+    /body\{--dshgit-success-text[\s\S]{0,400}?\}/.exec(css)?.[0] ?? '')
+  // A deleted row keeps its path on screen (the diff is the last copy of the
+  // content) and says so with a strike-through, over the whole path.
+  check('deleted rows are struck through over filename and directory',
+    /\.dshgit-change\[data-status="D"\][^{]*\{[^}]*text-decoration:line-through/.test(css) &&
+    /\.dshgit-change\[data-status="D"\][^{]*\.dshgit-filename/.test(css) &&
+    /\.dshgit-change\[data-status="D"\][^{]*\.dshgit-filedir/.test(css),
+    (css.match(/\.dshgit-change\[data-status="D"\][^{]*\{[^}]*\}/g) ?? []).join(' '))
+}
 check('change rows carry the file icon and label',
   walk(changeRow).some((node) => node.props?.className === 'dshgit-fileicon') &&
   walk(changeRow).some((node) => node.props?.className === 'dshgit-filelabel'))
