@@ -1693,6 +1693,26 @@ console.log('\n--- commit selection renders a diff ---')
   check('commit detail pane shows the message', hasText(tree, '详见说明。'), textOf(tree).slice(-400))
   check('commit detail pane shows the changed file summary',
     hasText(tree, 'src/index.js'), textOf(tree).slice(-400))
+  // Every split-pane list is resizable: the sidebar grip is always mounted, so
+  // a second grip can only be the commit detail's file-list divider. A
+  // multi-column layout the user cannot rebalance buries the file names.
+  check('the commit detail file list has its own resize grip',
+    walk(tree).filter((node) => String(node.props?.className ?? '').includes('dshgit-pane-grip')).length >= 2,
+    JSON.stringify(walk(tree).filter((node) => String(node.props?.className ?? '').includes('dshgit-pane-grip')).length))
+  // The grip is absolutely positioned inside the pane it resizes, so every
+  // resizable pane must be a positioning context — otherwise the grip escapes
+  // to the viewport corner. The stash/history file lists share this rule, and
+  // both stacks collapse to one column under 760px, where the grip must go.
+  {
+    const css = String(loaded.appendedStyles[0]?.textContent ?? '')
+    const gripHosts = /\.dshgit-sidebar[^{]*\{[^}]*position:relative/.exec(css)?.[0] ?? ''
+    check('every split-pane list is a positioning context for its grip',
+      gripHosts.includes('.dshgit-stash-filenav') && gripHosts.includes('.dshgit-commitfiles-nav') &&
+      gripHosts.includes('.dshgit-fileviewernav'), gripHosts)
+    check('stacked layouts hide the file-list grips',
+      css.includes('@media(max-width:760px){.dshgit-stash-filenav>.dshgit-pane-grip{display:none}}'),
+      'no 760px hide rule')
+  }
   // File-level statuses live here, on each changed file's card in the detail
   // pane — this is where a rename surfaces as an `R` badge.
   // NOTE: the live history detail (`HistoryCommitDetails`) never renders a rename
@@ -1706,6 +1726,27 @@ console.log('\n--- commit selection renders a diff ---')
     hasText(tree, 'src/index.js') &&
     walk(tree).some((node) => String(node.props?.className ?? '').includes('dshgit-diff-preview')),
     JSON.stringify(textOf(tree).slice(-300)))
+  // The code column is squeezed by the file list beside it, so the preview
+  // toolbar offers an enlarge that hides the list and lets the diff fill the
+  // detail area (the same view the graph panel reaches by clicking a file).
+  {
+    const expand = walk(tree).find((node) => String(node.props?.className ?? '').includes('dshgit-history-expand'))
+    check('the file preview offers an enlarge toggle', expand !== undefined)
+    if (expand !== undefined) {
+      check('the enlarge toggle starts unpressed', expand.props['aria-pressed'] === false)
+      expand.props.onClick()
+      tree = await flush(GitApp, rootProps)
+      const nav = walk(tree).find((node) => String(node.props?.className ?? '').includes('dshgit-stash-filenav'))
+      const pressed = walk(tree).find((node) => String(node.props?.className ?? '').includes('dshgit-history-expand'))
+      check('enlarging hides the file list and marks the toggle',
+        nav?.props?.style?.display === 'none' && pressed?.props['aria-pressed'] === true,
+        JSON.stringify({ nav: nav?.props?.style, pressed: pressed?.props?.['aria-pressed'] }))
+      pressed.props.onClick()
+      tree = await flush(GitApp, rootProps)
+      check('restoring brings the file list back',
+        walk(tree).find((node) => String(node.props?.className ?? '').includes('dshgit-stash-filenav'))?.props?.style?.display !== 'none')
+    }
+  }
 }
 
 console.log('\n--- graph tab ---')
@@ -4272,6 +4313,28 @@ console.log('\n--- header launchers restore their own repository after sidebar n
   check('nested shortcuts are disabled during a write operation', findAll(tree, 'button').every(node => node.props.disabled))
   tree = mount(Component, { ...props, status: { files: [{ path: 'ordinary.txt', kind: 'untracked' }] } }).tree
   check('ordinary untracked files do not produce a repository notice', findAll(tree, 'button').length === 0 && !hasText(tree, t('nested.title')))
+}
+
+console.log('\n--- same-named files stay distinguishable ---')
+// The muted directory suffix is the only disambiguator between two rows named
+// `view.js` in a flat list. It is rendered VERBATIM — the panes are sized wide
+// enough for it, and the file-list grip lets the user widen them further — so
+// no JS-side shortening may eat the last folder, which is the part that
+// differs. Its own renderApp is fine here: this is the last section that
+// touches the shared tree, and the hook-path store would otherwise be reset
+// mid-suite for every later `flush`.
+{
+  const deep = await renderApp(healthyHandlers({
+    status: () => ({ ...STATUS, files: [
+      { path: 'lib/client/features/changes/view.js', originalPath: null, index: '.', worktree: 'M', staged: false, kind: 'ordinary', added: 1, deleted: 0, binary: false },
+      { path: 'lib/client/features/history/view.js', originalPath: null, index: '.', worktree: 'M', staged: false, kind: 'ordinary', added: 1, deleted: 0, binary: false },
+    ], total: 2 }),
+  }))
+  const dirs = walk(deep).filter((node) => node.props?.className === 'dshgit-filedir').map((node) => textOf(node))
+  check('directory suffixes are rendered in full, not pre-shortened',
+    dirs.length >= 2 && new Set(dirs).size === dirs.length &&
+    dirs.every((dir) => !dir.includes('\u2026') && dir.startsWith('lib/client/features/')),
+    JSON.stringify(dirs))
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
