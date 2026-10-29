@@ -6,6 +6,23 @@ import { readWorktreePreferences, setWorktreeNote, touchWorktree, moveWorktreePr
 import { readWorktreeDraft, writeWorktreeDraft, clearWorktreeDraft, moveWorktreeDraft } from '../lib/client/features/worktrees/drafts.js'
 import { chooseDirectory, desktopChooser, desktopPlatform } from '../lib/client/features/clone/picker-source.js'
 import { cloneDestination, cloneDestinationProblem } from '../lib/client/features/clone/model.js'
+import { getReviewPrefs, setReviewPrefs, withReviewPrefs } from '../lib/client/core/preferences.js'
+import { pickSelection, rewriteSelection } from '../lib/client/features/history/rewrite.js'
+import {
+  initialPlan,
+  movedRow,
+  planCounts,
+  planProblem,
+  planRequest,
+  resetPlan,
+  setRowAction,
+  unexpectedDrops,
+} from '../lib/client/features/history/rebase-model.js'
+
+/** A stable 40-character sha for one letter, so verdict tables stay readable. */
+function sha(letter) {
+  return letter.repeat(40)
+}
 
 for (const text of ['git version 2.36.0', 'git version 2.50.1.windows.1', 'git version 3.0.0']) {
   assert.equal(assertGitVersion(text).text, text)
@@ -351,3 +368,186 @@ assert.equal(cloneDestination('C:\\Users\\me', 'app'), 'C:\\Users\\me\\app')
 assert.equal(cloneDestinationProblem('/Users/me', 'ok '), null)
 assert.equal(cloneDestinationProblem('C:\\Users\\me', 'ok'), null)
 console.log('PASS a rejected destination names its reason and agrees with the computed path')
+
+// ---------------------------------------------------------------------------
+// The range editor's rules, asserted without a DOM.
+//
+// These decisions move someone's commits, so they live in a pure module and are
+// checked here rather than through a rendered dialog. What this covers is the failure
+// that has no error message: a button enabled while the Host will refuse the plan, so
+// the user does everything asked and is still told no.
+// ---------------------------------------------------------------------------
+{
+  const commits = [
+    { sha: sha('a'), shortSha: 'aaaaaaa1', subject: 'one' },
+    { sha: sha('b'), shortSha: 'bbbbbbb2', subject: 'two' },
+    { sha: sha('c'), shortSha: 'ccccccc3', subject: 'three' },
+  ]
+
+  // Opening the editor changes nothing: every row starts as `pick`.
+  const plan = initialPlan(commits)
+  assert.deepEqual(plan.map((row) => row.action), ['pick', 'pick', 'pick'])
+  assert.deepEqual(plan.map((row) => row.sha), commits.map((commit) => commit.sha))
+  assert.equal(planProblem(plan, {}).ok, true)
+
+  // Reordering is by index and never mutates the input.
+  const swapped = movedRow(plan, 0, 1)
+  assert.deepEqual(swapped.map((row) => row.sha), [sha('b'), sha('a'), sha('c')])
+  assert.deepEqual(plan.map((row) => row.sha), commits.map((commit) => commit.sha), 'the input list is untouched')
+  assert.equal(movedRow(plan, 0, -1), plan, 'moving past the top returns the same list')
+  assert.equal(movedRow(plan, 2, 1), plan, 'moving past the bottom returns the same list')
+
+  // A leading fold is not representable, so it is refused at the source rather than
+  // stored and rejected later.
+  assert.equal(setRowAction(plan, 0, 'squash')[0].action, 'pick')
+  assert.equal(setRowAction(plan, 0, 'fixup')[0].action, 'pick')
+  assert.equal(setRowAction(plan, 1, 'squash')[1].action, 'squash')
+  assert.equal(setRowAction(plan, 1, 'not-a-verb'), plan, 'an unknown verb is ignored')
+  const droppedFirst = setRowAction(plan, 0, 'drop')
+  assert.equal(setRowAction(droppedFirst, 1, 'fixup'), droppedFirst, 'a dropped prefix is not a fold target')
+  assert.equal(planProblem([{ ...plan[0], action: 'drop' }, { ...plan[1], action: 'squash' }], {}).reason, 'leadingFold')
+  assert.equal(planProblem([{ ...plan[0], action: 'drop' }, { ...plan[1], action: 'fixup' }], {}).detail, plan[1].shortSha)
+
+  // Counts come from the rows, and "kept" is what the branch carries: folded rows
+  // disappear into their target and dropped rows disappear entirely.
+  const folded = setRowAction(plan, 1, 'fixup')
+  const mixed = folded.map((row, index) => (index === 2 ? Object.assign({}, row, { action: 'drop' })
+    : index === 0 ? Object.assign({}, row, { action: 'reword' }) : row))
+  const counts = planCounts(mixed)
+  assert.deepEqual([counts.reword, counts.fixup, counts.drop, counts.kept], [1, 1, 1, 1])
+
+  // Every refusal names the rule that refused, because each has a different fix.
+  assert.equal(planProblem([], {}).reason, 'empty')
+  assert.equal(planProblem([Object.assign({}, plan[0], { action: 'squash' })], {}).reason, 'leadingFold')
+  assert.equal(planProblem(plan.map((row) => Object.assign({}, row, { action: 'drop' })), {}).reason, 'allDropped')
+  // A published commit blocks the plan until the user says nobody else has it.
+  assert.equal(planProblem(plan, { published: 2 }).reason, 'published')
+  assert.equal(planProblem(plan, { published: 2 }).detail, '2', 'the refusal states how many')
+  assert.equal(planProblem(plan, { published: 2, allowPublished: true }).ok, true)
+
+  // Reset keeps the order but clears both actions and message drafts.
+  const reset = resetPlan(mixed)
+  assert.deepEqual(reset.map((row) => row.action), ['pick', 'pick', 'pick'])
+  assert.deepEqual(reset.map((row) => row.sha), mixed.map((row) => row.sha))
+
+  // The request carries messages only for rows that were actually edited, so an
+  // untouched row leaves its message alone instead of re-sending the original.
+  const edited = plan.map((row, index) => (index === 1 ? Object.assign({}, row, { action: 'reword', message: 'new text' }) : row))
+  const request = planRequest('base-sha', edited)
+  assert.equal(request.base, 'base-sha')
+  assert.deepEqual(Object.keys(request.messages), [sha('b')])
+  assert.deepEqual(request.commits[1], { sha: sha('b'), action: 'reword' })
+  for (const action of ['pick', 'edit', 'drop']) {
+    const cancelled = setRowAction(edited, 1, action)
+    assert.equal(cancelled[1].message, '')
+    assert.deepEqual(planRequest('base-sha', cancelled).messages, {})
+    assert.deepEqual(planRequest('base-sha', [{ ...edited[1], action }]).messages, {}, 'even a retained draft cannot rewrite a non-message action')
+  }
+  assert(resetPlan(edited).every(row => row.message === ''))
+  assert.deepEqual(planRequest('base-sha', resetPlan(edited)).messages, {})
+
+  // A commit the user dropped themselves needs no explanation; one that vanished on
+  // its own does, because "I asked for 3 and got 2" otherwise reads as a bug.
+  const gitDropped = [{ sha: sha('c'), subject: 'three', reason: 'already applied upstream' }]
+  assert.deepEqual(unexpectedDrops(gitDropped, mixed), [], 'a row the user dropped is expected')
+  assert.equal(unexpectedDrops(gitDropped, plan).length, 1, 'a row the user kept but git dropped is reported')
+}
+console.log('PASS the range editor keeps every row, refuses a leading fold, and explains each refusal by its own rule')
+
+// ---------------------------------------------------------------------------
+// Ticking drives TWO verdicts over the same selection.
+//
+// Rewriting needs one contiguous unpushed chain; picking accepts any set of non-merge
+// commits. Reporting a single verdict meant a valid "apply these three fixes here"
+// selection was described as impossible, so both are computed and each refuses only
+// for its own reason.
+// ---------------------------------------------------------------------------
+{
+  const list = [
+    { sha: sha('d'), parents: [sha('c')], unpublished: true },
+    { sha: sha('c'), parents: [sha('b')], unpublished: true },
+    { sha: sha('b'), parents: [sha('a')], unpublished: true },
+    { sha: sha('a'), parents: [], unpublished: false },
+  ]
+  // A contiguous unpushed run can be rewritten AND picked.
+  assert.equal(rewriteSelection(list, [sha('d'), sha('c')]).action, 'squash')
+  assert.equal(rewriteSelection(list, [sha('d'), sha('c')]).ok, true)
+  // The pick queue is oldest-first: replaying newest-first would apply a commit
+  // before the one it builds on.
+  assert.deepEqual(pickSelection(list, [sha('d'), sha('c')]).shas, [sha('c'), sha('d')])
+
+  // A gap blocks the rewrite but not the pick: the set is still replayable.
+  const sparse = [sha('d'), sha('b')]
+  assert.equal(rewriteSelection(list, sparse).reason, 'gap')
+  assert.deepEqual(pickSelection(list, sparse).shas, [sha('b'), sha('d')])
+  // A published commit blocks the rewrite but not the pick: copying an old commit
+  // onto this branch rewrites nothing.
+  assert.equal(rewriteSelection(list, [sha('a')]).reason, 'pushed')
+  assert.equal(pickSelection(list, [sha('a')]).ok, true)
+
+  // A merge commit cannot be queued: replaying one needs a mainline parent, and
+  // guessing it silently discards one side of the merge.
+  const merged = [{ sha: sha('e'), parents: [sha('d'), sha('c')], unpublished: true }, ...list]
+  assert.equal(pickSelection(merged, [sha('e')]).reason, 'merge')
+  assert.equal(pickSelection(merged, [sha('e'), sha('b')]).ok, false, 'a mixed set is refused as a whole')
+
+  // A tick for a commit the view no longer lists is stale, not silently ignored.
+  assert.equal(pickSelection(list, [sha('f')]).reason, 'stale')
+  assert.equal(pickSelection(list, []).action, null)
+}
+console.log('PASS ticking computes separate rewrite and pick verdicts with oldest-first queue order')
+
+// ---------------------------------------------------------------------------
+// The review switches attach to a diff request, and only when they are not default.
+//
+// Sending `ignoreWhitespace: false` is harmless to git and harmful to the command log:
+// every read would look deliberate, and the log is where a user checks what actually
+// ran. `-b` is also strictly stronger than `-w`, so holding both would send two flags
+// whose combined meaning is "the last one wins".
+// ---------------------------------------------------------------------------
+{
+  const original = globalThis.localStorage
+  const storage = new Map()
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: { getItem: key => (storage.has(key) ? storage.get(key) : null), setItem: (key, value) => storage.set(key, String(value)) },
+  })
+  try {
+    // Defaults send NOTHING, so an ordinary read stays an ordinary read.
+    assert.deepEqual(withReviewPrefs({ root: '/repo', path: 'a.js' }), { root: '/repo', path: 'a.js' })
+
+    // Whitespace handling is one choice, not two independent flags.
+    setReviewPrefs({ ignoreWhitespace: true, ignoreAllSpace: false })
+    assert.equal(withReviewPrefs({ path: 'a.js' }).ignoreWhitespace, true)
+    assert.equal(withReviewPrefs({ path: 'a.js' }).ignoreAllSpace, undefined)
+    setReviewPrefs({ ignoreWhitespace: true, ignoreAllSpace: true })
+    assert.equal(getReviewPrefs().ignoreWhitespace, false, 'the stronger flag displaces the weaker one')
+    assert.equal(withReviewPrefs({ path: 'a.js' }).ignoreAllSpace, true)
+
+    // Word diff, algorithm and context travel independently.
+    setReviewPrefs({ ignoreWhitespace: false, ignoreAllSpace: false, wordDiff: true, algorithm: 'histogram', contextLines: 10 })
+    const payload = withReviewPrefs({ path: 'a.js' })
+    assert.equal(payload.wordDiff, true)
+    assert.equal(payload.algorithm, 'histogram')
+    assert.equal(payload.contextLines, 10)
+
+    // An unknown algorithm is dropped rather than sent: git fails the whole diff on an
+    // option it does not know, which would read as "this file cannot be opened".
+    setReviewPrefs({ algorithm: 'bogus' })
+    assert.equal(withReviewPrefs({ path: 'a.js' }).algorithm, undefined)
+
+    // Context must stay within the offered choices, and 3 is the default that sends
+    // nothing.
+    setReviewPrefs({ contextLines: 7 })
+    assert.equal(getReviewPrefs().contextLines, 3)
+    setReviewPrefs({ contextLines: 3 })
+    assert.equal(withReviewPrefs({ path: 'a.js' }).contextLines, undefined)
+
+    // Resetting every switch returns the payload to a plain read.
+    setReviewPrefs({ ignoreWhitespace: false, ignoreAllSpace: false, wordDiff: false, algorithm: '', contextLines: 3 })
+    assert.deepEqual(withReviewPrefs({ path: 'a.js' }), { path: 'a.js' })
+  } finally {
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: original })
+  }
+}
+console.log('PASS review switches attach only non-default values and never send both whitespace flags')

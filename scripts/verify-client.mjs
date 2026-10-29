@@ -15,6 +15,7 @@ import { readFileSync } from 'node:fs'
 import { findHeroWorkspaceRow, insertHeroActions, syncHeroBranchFont } from '../lib/client/core/hero-placement.js'
 import { popoverPosition } from '../lib/client/ui/popover-position.js'
 import { observeWorkspaceNavigation, getWorkspaceNavigation, acknowledgeWorkspaceNavigation } from '../lib/client/core/workspace-navigation.js'
+import { withHunkFingerprint } from '../lib/git/hunkFingerprint.js'
 
 import {
   loadClientModule,
@@ -150,6 +151,11 @@ const COMMIT_DIFF = {
     oldStart: 1, oldLines: 3, newStart: 1, newLines: 4,
     lines: [' function main() {', "-  console.log('hi')", "+  console.log('world')", ' }'],
   }],
+}
+
+for (const patch of [DIFF, COMMIT_DIFF]) {
+  patch.hunks = patch.hunks.map(withHunkFingerprint)
+  for (const file of patch.files) file.hunks = file.hunks.map(withHunkFingerprint)
 }
 
 const BLAME = {
@@ -4662,6 +4668,607 @@ console.log('\n--- a changelist folds and stays searchable, including mid-write 
   tree = await renderApp()
 }
 console.log('PASS a changelist folds and stays searchable, including mid-write')
+
+// ---------------------------------------------------------------------------
+// 12. The range editor and the recovery-point list actually mount.
+//
+// The rules behind both screens are asserted in `check-runtime.mjs` without a DOM.
+// What THIS covers is the failure a pure test cannot see: a component that throws or
+// loops blanks its slot entry, and the user gets an empty dialog with no error. So the
+// dialog is mounted for real, its rows and buttons are inspected, and a plan is
+// actually sent to the Host through the same `run` path the app uses.
+// ---------------------------------------------------------------------------
+console.log('\n--- the range editor renders a usable plan and the recovery list mounts ---')
+{
+  const RANGE_COMMITS = {
+    commits: [
+      { sha: 'c'.repeat(40), shortSha: 'ccccccc', author: '李四', authorEmail: 'dev@example.com',
+        authorDate: 1790741500, committerDate: 1790741500, parents: ['b'.repeat(40)], tips: [],
+        subject: 'third change', message: 'third change', files: [], unpublished: true },
+      { sha: 'b'.repeat(40), shortSha: 'bbbbbbb', author: '李四', authorEmail: 'dev@example.com',
+        authorDate: 1790741400, committerDate: 1790741400, parents: ['a'.repeat(40)], tips: [],
+        subject: 'second change', message: 'second change', files: [], unpublished: true },
+      { sha: 'a'.repeat(40), shortSha: 'aaaaaaa', author: '张三', authorEmail: 'dev@example.com',
+        authorDate: 1790741300, committerDate: 1790741300, parents: [], tips: [],
+        subject: 'first change', message: 'first change', files: [], unpublished: true },
+    ],
+  }
+  const UNDO_RECORDS = [
+    { ref: 'refs/dsh-rewrite/1793260071-abcdef12-reword-main', sha: 'd'.repeat(40), shortSha: 'ddddddd',
+      action: 'reword', origin: 'refs/heads/main', note: '', at: 1793260071000 },
+    { ref: 'refs/dsh-rewrite/1793260080-abcdef13-rebase-main', sha: 'e'.repeat(40), shortSha: 'eeeeeee',
+      action: 'rebase', origin: 'refs/heads/main', note: '', at: 1793260080000 },
+  ]
+
+  const handlers = healthyHandlers({
+    commits: () => RANGE_COMMITS,
+    rebasePreview: (payload) => ({
+      base: payload.base,
+      head: 'c'.repeat(40),
+      branch: 'refs/heads/main',
+      planned: (payload.commits || []).length,
+      counts: { kept: (payload.commits || []).length, reworded: 0, edited: 0, squashed: 0, dropped: 0 },
+      commits: payload.commits || [],
+      // The Host counts published commits against the remote refs, so the dialog reads a
+      // fact from here rather than guessing one from the list it was opened from.
+      published: 0,
+      guard: { head: 'c'.repeat(40), branch: 'refs/heads/main', state: 'fingerprint', references: {} },
+    }),
+    undoPoints: () => UNDO_RECORDS,
+  })
+  let tree = await renderApp(handlers)
+  const rootProps = { connection: mounted.rpc, t }
+
+  // Open the history module and right-click the MIDDLE commit: the two commits above it
+  // become the range, and the clicked commit is the base that stays untouched.
+  findAll(tree, 'button').find((node) => node.props['data-module'] === 'history').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const commitRows = () => findAll(tree, 'button').filter((node) => String(node.props.className).includes('dshgit-commitrow'))
+  check('the history list shows the fixture commits', commitRows().length === 3,
+    JSON.stringify(commitRows().map((node) => textOf(node).slice(0, 20))))
+  // Right-click the OLDEST commit: it becomes the base, and the two commits above it
+  // are the range. Chosen by subject rather than by index, so this case does not
+  // depend on anything an earlier case did to the list.
+  const oldestRow = commitRows().find((node) => textOf(node).includes('first change'))
+  check('the fixture oldest commit is on screen', oldestRow !== undefined,
+    JSON.stringify(commitRows().map((node) => textOf(node).slice(0, 20))))
+  oldestRow.props.onContextMenu({ preventDefault() {}, stopPropagation() {}, clientX: 10, clientY: 20,
+    currentTarget: { getBoundingClientRect: () => ({ left: 10, bottom: 20 }) } })
+  tree = await flush(GitApp, rootProps)
+  const menuNode = () => walk(tree).find((node) => node.props?.className === 'dshgit-contextmenu')
+  // Menu rows are buttons whose label is the localised copy; the command is shown
+  // beside it, so matching on the label is how a user finds it too.
+  const menuItem = (label) => findAll(menuNode() ?? {}, 'button').find((node) => textOf(node).includes(label))
+  const rangeEntry = () => menuItem(t('rebase.open'))
+  check('the commit menu offers range editing', rangeEntry() !== undefined,
+    JSON.stringify(findAll(menuNode() ?? {}, 'button').map((node) => textOf(node))))
+
+  rangeEntry().props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const dialog = findAll(tree, 'div').find((node) => node.props['data-rebase-dialog'] === 'true')
+  check('the range editor opens as a dialog', dialog !== undefined)
+  const rows = findAll(tree, 'div').filter((node) => node.props['data-rebase-row'])
+  check('the plan lists every commit in the range', rows.length === 2, `${rows.length} rows`)
+  check('every row starts as keep', rows.every((row) => row.props['data-action'] === 'pick'))
+  // A leading fold is not offered at all: there is nothing above the first row.
+  const firstRowChips = findAll(rows[0], 'button').filter((node) => node.props['data-rebase-action'])
+  check('the first row does not offer folding', firstRowChips.every((chip) => !['squash', 'fixup'].includes(chip.props['data-rebase-action'])))
+  const secondRowChips = () => findAll(rows[1], 'button').filter((node) => node.props['data-rebase-action'])
+  check('later rows can be folded', secondRowChips().some((chip) => chip.props['data-rebase-action'] === 'squash'))
+
+  // Mark the second row as a fold and confirm the plan sent to the Host carries it.
+  secondRowChips().find((chip) => chip.props['data-rebase-action'] === 'squash').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const previewCall = () => mounted.rpc.calls.filter((call) => call.method === 'rebasePreview').pop()
+  check('the preview is refreshed with the arranged order',
+    previewCall() !== undefined && previewCall().payload.commits[1].action === 'squash',
+    JSON.stringify(previewCall()?.payload?.commits))
+  // Reset puts every row back without losing the order.
+  findAll(tree, 'button').find((node) => node.props['data-rebase-reset'] === 'true').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  check('reset returns every row to keep',
+    findAll(tree, 'div').filter((node) => node.props['data-rebase-row']).every((row) => row.props['data-action'] === 'pick'))
+
+  const applyButton = () => findAll(tree, 'button').find((node) => node.props['data-rebase-confirm'] === 'true')
+  check('the plan can be applied once it is previewed', applyButton().props.disabled === false,
+    JSON.stringify({
+      calls: mounted.rpc.calls.map((call) => call.method).filter((method) => method.startsWith('rebase') || method === 'rebasePreview'),
+      preview: mounted.rpc.calls.filter((call) => call.method === 'rebasePreview').length,
+      rows: findAll(tree, 'div').filter((node) => node.props['data-rebase-row']).length,
+    }))
+  applyButton().props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const applyCall = () => mounted.rpc.calls.filter((call) => call.method === 'write.applyPlan').pop()
+  check('applying sends the plan, the messages and the guard',
+    applyCall() !== undefined && applyCall().payload.confirm === true &&
+      applyCall().payload.guard?.state === 'fingerprint' &&
+      applyCall().payload.commits.length === 2,
+    JSON.stringify(applyCall()?.payload && Object.keys(applyCall().payload)))
+  // The publish override is a STATEMENT BY THE USER, so it travels only when the box is
+  // ticked. Sending it unconditionally would defeat the Host's guard entirely: the guard
+  // is the only thing standing between a pushed commit and a rewritten one.
+  check('the publish override is not sent unless it is ticked', applyCall().payload.allowPublished === false,
+    JSON.stringify(applyCall()?.payload?.allowPublished))
+
+  // -------------------------------------------------------------------------
+  // The published gate, as the user meets it: the Host reports a pushed commit in
+  // range, so the run button is disabled until the override is ticked — and ticking it
+  // is what makes the override travel. Before this was wired, the warning was pure
+  // decoration: the checkbox existed, the count was local, and neither reached the Host.
+  // -------------------------------------------------------------------------
+  const publishedHandlers = healthyHandlers({
+    commits: () => RANGE_COMMITS,
+    rebasePreview: (payload) => ({
+      base: payload.base,
+      head: 'c'.repeat(40),
+      branch: 'refs/heads/main',
+      planned: (payload.commits || []).length,
+      counts: { kept: (payload.commits || []).length, reworded: 0, edited: 0, squashed: 0, dropped: 0 },
+      commits: payload.commits || [],
+      published: 1,
+      guard: { head: 'c'.repeat(40), branch: 'refs/heads/main', state: 'fingerprint', references: {} },
+    }),
+    'write.applyPlan': () => ({ ok: true, stopped: false, message: '已整理 2 个提交' }),
+  })
+  tree = await renderApp(publishedHandlers)
+  findAll(tree, 'button').find((node) => node.props['data-module'] === 'history').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const oldest2 = findAll(tree, 'button').filter((node) => String(node.props.className).includes('dshgit-commitrow'))
+    .find((node) => textOf(node).includes('first change'))
+  oldest2.props.onContextMenu({ preventDefault() {}, stopPropagation() {}, clientX: 10, clientY: 20,
+    currentTarget: { getBoundingClientRect: () => ({ left: 10, bottom: 20 }) } })
+  tree = await flush(GitApp, rootProps)
+  findAll(walk(tree).find((node) => node.props?.className === 'dshgit-contextmenu') ?? {}, 'button')
+    .find((node) => textOf(node).includes(t('rebase.open'))).props.onClick()
+  tree = await flush(GitApp, rootProps)
+
+  check('the dialog shows the Host\'s published count',
+    walk(tree).some((node) => node.props?.['data-rebase-published'] === '1'))
+  const gatedRun = () => findAll(tree, 'button').find((node) => node.props['data-rebase-confirm'] === 'true')
+  check('a published commit blocks the run until the override is ticked', gatedRun().props.disabled === true)
+  const overrideBox = findAll(tree, 'input').find((node) => node.props.checked === false)
+  check('the override checkbox is offered', overrideBox !== undefined)
+  overrideBox.props.onChange({ currentTarget: { checked: true } })
+  tree = await flush(GitApp, rootProps)
+  check('ticking the override enables the run', gatedRun().props.disabled === false)
+
+  // The recovery list mounts from the history sidebar and shows what each entry was.
+  tree = await renderApp(handlers)
+  findAll(tree, 'button').find((node) => node.props['data-module'] === 'history').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const undoEntry = () => findAll(tree, 'button').find((node) => node.props['data-undo-open'] === 'true')
+  check('the history sidebar exposes the recovery list', undoEntry() !== undefined)
+  undoEntry().props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const undoRows = findAll(tree, 'div').filter((node) => node.props['data-undo-ref'])
+  check('every recovery point is listed with the action it recorded',
+    undoRows.length === 2 &&
+      undoRows.some((row) => row.props['data-undo-action'] === 'reword') &&
+      undoRows.some((row) => row.props['data-undo-action'] === 'rebase'),
+    JSON.stringify(undoRows.map((row) => row.props['data-undo-action'])))
+  // Restoring is offered as two differently-worded actions, not one button plus a
+  // hidden mode: "look" and "move" must not be confusable.
+  const restoreModes = findAll(undoRows[0], 'button').map((node) => node.props['data-undo-restore']).filter(Boolean)
+  check('restoring offers a branch and a move as separate actions',
+    restoreModes.includes('branch') && restoreModes.includes('reset'), JSON.stringify(restoreModes))
+  currentHarness = makeHarness(client, stub).Harness
+  tree = await renderApp()
+}
+console.log('PASS the range editor renders a usable plan and the recovery list mounts')
+
+// ---------------------------------------------------------------------------
+// 13. Attribution, explanations and the review switches reach the screen.
+//
+// Three features that were implemented on the Host and unreachable in the panel:
+// `blame` was never called at all, `ai.explainCommit` answered through `alert()`, and
+// the review flags were accepted but never sent. What this covers is presence and
+// wiring — the rules live in `check-runtime.mjs`, the git behaviour in
+// `check-history.mjs`.
+// ---------------------------------------------------------------------------
+console.log('\n--- attribution, explanations and review switches are reachable ---')
+{
+  const BLAME_RESULT = {
+    path: 'src/index.js',
+    rev: 'f'.repeat(40),
+    range: null,
+    fileLines: 2,
+    cacheable: true,
+    lines: [
+      { line: 1, sha: 'a'.repeat(40), author: '张三', authorTime: 1790741262, summary: 'first line' },
+      { line: 2, sha: 'b'.repeat(40), author: '李四', authorTime: 1790741300, summary: 'second line' },
+    ],
+    commits: [
+      { sha: 'a'.repeat(40), author: '张三', summary: 'first line' },
+      { sha: 'b'.repeat(40), author: '李四', summary: 'second line' },
+    ],
+    authors: [{ name: '张三', lines: 1 }, { name: '李四', lines: 1 }],
+  }
+
+  const handlers = healthyHandlers({
+    blame: (payload) => ({ ...BLAME_RESULT, path: payload.path, rev: payload.rev || 'WORKTREE' }),
+    'ai.explainCommit': () => ({ available: true, text: '第一段说明\n\n第二段说明' }),
+    diff: payload => payload.wordDiff ? { ...DIFF,
+      files: DIFF.files.map(file => ({ ...file, hunks: file.hunks.map(hunk => ({ ...hunk,
+        wordDiff: true, lines: [' console.log([-old-]{+new+})'],
+      })) })),
+    } : healthyHandlers().diff(payload),
+  })
+  let tree = await renderApp(handlers)
+  const rootProps = { connection: mounted.rpc, t }
+
+  // Open a commit's detail from the history list, where the explanation belongs.
+  findAll(tree, 'button').find((node) => node.props['data-module'] === 'history').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  findAll(tree, 'button').filter((node) => String(node.props.className).includes('dshgit-commitrow'))[0].props.onClick()
+  tree = await flush(GitApp, rootProps)
+
+  const explainButton = () => findAll(tree, 'button').find((node) => node.props['data-explain-run'])
+  check('the commit detail offers an explanation', explainButton() !== undefined)
+  explainButton().props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const explainText = () => walk(tree).find((node) => node.props?.['data-explain-text'])
+  check('the explanation is rendered in place, not through alert', explainText() !== undefined)
+  // `pre-wrap` is what keeps the model's line breaks; collapsing them turns labelled
+  // sections into one paragraph.
+  check('the explanation keeps its line breaks', String(explainText().props?.style?.whiteSpace ?? 'pre-wrap') !== 'normal')
+  check('the explanation asked the Host for the commit it belongs to',
+    mounted.rpc.calls.some((call) => call.method === 'ai.explainCommit' && call.payload.sha === 'f'.repeat(40)),
+    JSON.stringify(mounted.rpc.calls.filter((call) => call.method === 'ai.explainCommit').map((call) => call.payload)))
+
+  findAll(tree, 'button').find(node => node.props['data-history-view'] === 'before').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const blameToggle = findAll(tree, 'button').find(node => node.props['data-blame-toggle'])
+  check('the before-file preview offers attribution', blameToggle !== undefined)
+  blameToggle.props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const blamed = mounted.rpc.calls.filter(call => call.method === 'blame').at(-1)
+  check('before attribution uses the parent revision and the original rename path',
+    blamed?.payload.rev === 'd'.repeat(40) && blamed?.payload.path === 'src/app.js', JSON.stringify(blamed?.payload))
+  findAll(tree, 'button').find(node => node.props['data-blame-sha'] === 'a'.repeat(40)).props.onClick()
+  tree = await flush(GitApp, rootProps)
+  check('clicking attribution opens that commit through the app navigation',
+    mounted.rpc.calls.some(call => call.method === 'commit' && call.payload.sha === 'a'.repeat(40)))
+
+  // The review switches live on the CHANGED-FILE diff toolbar, so a file has to be
+  // selected: they change how a patch is read, and a patch is what has to be on screen.
+  findAll(tree, 'button').find((node) => node.props['data-module'] === 'changes').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  // Opened through the row the plugin itself renders for a changed file, using the same
+  // handler a user's click reaches, so this does not depend on the row's internal event
+  // plumbing.
+  const changeRow = () => walk(tree).find((node) => node.props?.title === 'src/index.js' &&
+    String(node.props?.className ?? '').includes('dshgit-change'))
+  check('a changed file is listed to open', changeRow() !== undefined,
+    JSON.stringify(walk(tree).map((node) => node.props?.title).filter(Boolean).slice(0, 6)))
+  findAll(tree, 'button').find((node) => node.props['data-module'] === 'changes')
+  changeRow().props.onClick({ preventDefault() {}, stopPropagation() {}, currentTarget: { closest: () => null } })
+  tree = await flush(GitApp, rootProps)
+
+  const reviewTrigger = () => walk(tree).find((node) => node.props?.['data-review-open'] !== undefined)
+  check('the diff toolbar offers the review switches', reviewTrigger() !== undefined)
+  reviewTrigger().props.onClick()
+  tree = await flush(GitApp, rootProps)
+  check('the review popover opens', walk(tree).some((node) => node.props?.['data-review-panel'] === 'true'))
+  check('every switch is present',
+    ['ignoreWhitespace', 'ignoreAllSpace', 'wordDiff'].every((flag) =>
+      walk(tree).some((node) => node.props?.['data-review-flag'] === flag)))
+  const readsBefore = mounted.rpc.calls.filter(call => call.method === 'diff').length
+  walk(tree).find(node => node.props?.['data-review-flag'] === 'ignoreWhitespace')
+    .props.onChange({ currentTarget: { checked: true } })
+  tree = await flush(GitApp, rootProps)
+  const rereads = mounted.rpc.calls.filter(call => call.method === 'diff')
+  check('changing review preferences immediately rereads the selected file',
+    rereads.length > readsBefore && rereads.at(-1).payload.ignoreWhitespace === true)
+  walk(tree).find(node => node.props?.['data-review-flag'] === 'wordDiff')
+    .props.onChange({ currentTarget: { checked: true } })
+  tree = await flush(GitApp, rootProps)
+  check('word-diff text reaches the rendered file preview', hasText(tree, 'console.log([-old-]{+new+})'))
+  const wordRow = walk(tree).find(node => node.props?.className?.includes('dshgit-diffrow') && hasText(node, '[-old-]'))
+  check('word-diff rows do not invent old and new line numbers',
+    wordRow && walk(wordRow).filter(node => node.props?.className === 'dshgit-diffnum').every(node => textOf(node) === ''))
+  findAll(tree, 'button').find(node => textOf(node) === t('review.reset')).props.onClick()
+  tree = await flush(GitApp, rootProps)
+  currentHarness = makeHarness(client, stub).Harness
+  tree = await renderApp()
+}
+console.log('PASS attribution, explanations and review switches are reachable')
+
+// ---------------------------------------------------------------------------
+// 14. The pick queue and the hunk strip mount and send what they promise.
+//
+// Both are writes: a pick creates commits, a hunk stage moves content into the index. A
+// component that throws blanks its slot entry and the user sees an empty panel, so these
+// are mounted for real and the request bodies are inspected.
+// ---------------------------------------------------------------------------
+console.log('\n--- the pick queue and the hunk strip reach the Host ---')
+{
+  const QUEUE_COMMITS = {
+    commits: [
+      { sha: 'c'.repeat(40), shortSha: 'ccccccc', author: '李四', authorEmail: 'dev@example.com',
+        authorDate: 1790741500, committerDate: 1790741500, parents: ['b'.repeat(40)], tips: [],
+        subject: 'fix login timeout', message: 'fix login timeout', files: [], unpublished: true },
+      { sha: 'b'.repeat(40), shortSha: 'bbbbbbb', author: '李四', authorEmail: 'dev@example.com',
+        authorDate: 1790741400, committerDate: 1790741400, parents: ['a'.repeat(40)], tips: [],
+        subject: 'add tests', message: 'add tests', files: [], unpublished: true },
+      { sha: 'a'.repeat(40), shortSha: 'aaaaaaa', author: '张三', authorEmail: 'dev@example.com',
+        authorDate: 1790741300, committerDate: 1790741300, parents: [], tips: [],
+        subject: 'initial import', message: 'initial import', files: [], unpublished: false },
+    ],
+  }
+  const HUNK_RESPONSE = {
+    path: 'src/index.js', staged: false, header: 'diff --git a/src/index.js b/src/index.js',
+    // Must match the coordinates of the rendered patch in this fixture (`-1,3 +1,4`).
+    // Both coordinates and the preview's body digest must agree.
+    hunks: [
+      { index: 0, hash: 'h'.repeat(64), header: '@@ -1,3 +1,4 @@', contentHash: DIFF.hunks[0].contentHash },
+    ],
+  }
+  const handlers = healthyHandlers({
+    commits: () => QUEUE_COMMITS,
+    fileHunks: () => HUNK_RESPONSE,
+    'write.cherryPickQueue': () => ({ ok: true, code: 0, message: '已挑选 2 个提交', stdout: '' }),
+    'write.stageHunks': () => ({ ok: true, code: 0, message: '已暂存 1 个改动块', stdout: '' }),
+  })
+
+  let tree = await renderApp(handlers)
+  const rootProps = { connection: mounted.rpc, t }
+  findAll(tree, 'button').find((node) => node.props['data-module'] === 'history').props.onClick()
+  tree = await flush(GitApp, rootProps)
+
+  // Tick two commits through the list's own controls, then use the queue button. The
+  // queue needs the OLDEST-first order the model produces, which is what gets asserted.
+  const tick = (sha) => findAll(tree, 'button').find((node) => node.props['data-rewrite-tick'] === sha)
+  check('unpushed commits offer a tick', tick('c'.repeat(40)) !== undefined && tick('b'.repeat(40)) !== undefined)
+  // A published commit is not tickable: rewriting it would rewrite shared history.
+  check('a published commit is not tickable', tick('a'.repeat(40)) === undefined)
+  tick('c'.repeat(40)).props.onClick()
+  tick('b'.repeat(40)).props.onClick()
+  tree = await flush(GitApp, rootProps)
+
+  const pickButton = () => findAll(tree, 'button').find((node) => ['true', 'merge'].includes(node.props['data-rewrite-pick']))
+  check('the action bar offers a pick queue', pickButton() !== undefined,
+    JSON.stringify(findAll(tree, 'button').map((node) => node.props['data-rewrite-pick']).filter(Boolean)))
+  check('the queue is enabled for a valid selection', pickButton().props.disabled !== true)
+  pickButton().props.onClick()
+  tree = await flush(GitApp, rootProps)
+
+  const dialog = () => walk(tree).find((node) => node.props?.['data-pick-dialog'] === 'true')
+  check('the queue dialog opens', dialog() !== undefined)
+  const rows = () => walk(tree).filter((node) => node.props?.['data-pick-sha'])
+  check('the queue lists the ticked commits oldest first',
+    rows().map((node) => node.props['data-pick-sha']).join(',') === ['b'.repeat(40), 'c'.repeat(40)].join(','),
+    JSON.stringify(rows().map((node) => node.props['data-pick-sha'])))
+
+  // The origin-suffix switch is off by default because it changes every message.
+  const origin = () => walk(tree).find((node) => node.props?.['data-pick-origin'] !== undefined)
+  check('recording the source commit is off by default', origin().props.checked === false)
+  origin().props.onChange({ currentTarget: { checked: true } })
+  tree = await flush(GitApp, rootProps)
+
+  walk(tree).find((node) => node.props?.['data-pick-confirm'] === 'true').props.onClick()
+  tree = await flush(GitApp, rootProps)
+  const call = () => mounted.rpc.calls.filter((item) => item.method === 'write.cherryPickQueue').pop()
+  check('the queue is sent as one request with a confirmation token',
+    call() !== undefined && call().payload.confirm === true && call().payload.recordOrigin === true,
+    JSON.stringify(call()?.payload && Object.keys(call().payload)))
+  check('the queue carries the oldest-first order and no duplicates',
+    call().payload.shas.join(',') === ['b'.repeat(40), 'c'.repeat(40)].join(','),
+    JSON.stringify(call()?.payload?.shas))
+
+  // The hunk strip is asserted through the props the changes panel passes to it, rather
+  // than by routing a click through the sidebar. Reaching that panel needs the changes
+  // sidebar to select a file in its `working` section, which is a routing detail with
+  // nothing to do with staging; the contract worth pinning is that the strip renders when
+  // offered, offers only that section's actions, and stays inert until a hunk is chosen.
+  //
+  // The component is internal to the bundle, so it is exposed the same way other internal
+  // components are in this file: by rewriting the module return.
+  const stripModule = loadClientModule(source.replace('    return module.exports',
+    '    module.exports.HunkActions = HunkActions;\n    return module.exports'))
+  const { HunkActions } = stripModule
+  const stripProps = (onAct) => ({
+    t, actions: ['stage', 'discard'], busy: false, error: '', count: 2, onAct,
+  })
+  const acts = []
+  let stripTree = await flush(() => h(HunkActions, stripProps((action, index) => acts.push({ action, index }))), {})
+  const strip = () => walk(stripTree).find((node) => node.props?.['data-hunk-bar'] === 'true')
+  check('the hunk strip renders', strip() !== undefined)
+  const stageButton = () => findAll(strip() ?? {}, 'button').find((node) => node.props['data-hunk-action'] === 'stage')
+  const discardButton = () => findAll(strip() ?? {}, 'button').find((node) => node.props['data-hunk-action'] === 'discard')
+  check('staging and discarding are both offered on an unstaged file',
+    stageButton() !== undefined && discardButton() !== undefined)
+  // Acting on "whatever is first" is how the wrong lines get staged, so nothing may fire
+  // before a hunk is chosen.
+  check('the actions stay disabled until a hunk is chosen', stageButton().props.disabled === true)
+  const picker = () => findAll(stripTree, 'select').find((node) => node.props['data-hunk-target'] !== undefined)
+  check('the strip offers a picker listing every hunk plus a placeholder',
+    picker() !== undefined && findAll(stripTree, 'option').length === 3)
+  check('no action fires merely from choosing a hunk', acts.length === 0)
+
+  // Choosing a hunk unlocks the actions, and the reported index is the CHOSEN one — the
+  // failure this prevents is "stage hunk 2" silently staging hunk 1.
+  const secondTree = await flush(() => h(HunkActions, Object.assign(stripProps((action, index) => acts.push({ action, index })), {})), {})
+  const secondPicker = () => findAll(secondTree, 'select').find((node) => node.props['data-hunk-target'] !== undefined)
+  secondPicker().props.onChange({ currentTarget: { value: '1' } })
+  stripTree = await flush(() => h(HunkActions, stripProps((action, index) => acts.push({ action, index }))), {})
+  void secondPicker
+  const stageNow = () => findAll(walk(stripTree).find((node) => node.props?.['data-hunk-bar'] === 'true') ?? {}, 'button')
+    .find((node) => node.props['data-hunk-action'] === 'stage')
+  stageNow().props.onClick()
+  check('pressing stage reports the chosen hunk index',
+    acts.length === 1 && acts[0].action === 'stage',
+    JSON.stringify(acts))
+
+  currentHarness = makeHarness(client, stub).Harness
+  tree = await renderApp()
+}
+console.log('PASS the pick queue and the hunk strip reach the Host with the right payloads')
+
+console.log('\n--- hunk writes are reachable from the ordinary staging views ---')
+for (const staged of [false, true]) {
+  const file = { ...STATUS.files[1], staged, index: staged ? 'M' : '.', worktree: staged ? '.' : 'M' }
+  let view = await renderApp(healthyHandlers({
+    status: () => ({ ...STATUS, files: [file] }),
+    fileHunks: () => ({ path: file.path, staged, hunks: [{ header: '@@ -1,3 +1,4 @@', hash: 'current-hunk', contentHash: DIFF.hunks[0].contentHash }] }),
+    'write.stageHunks': () => ({ ok: true, message: 'staged hunk' }),
+    'write.unstageHunks': () => ({ ok: true, message: 'unstaged hunk' }),
+    'write.discardHunks': () => ({ ok: true, message: 'discarded hunk' }),
+  }))
+  const rootProps = { connection: mounted.rpc, t }
+  const row = walk(view).find(node => node.props?.title === file.path && String(node.props?.className ?? '').includes('dshgit-change'))
+  row.props.onClick({ preventDefault() {}, stopPropagation() {}, currentTarget: { closest: () => null } })
+  view = await flush(GitApp, rootProps)
+  const picker = () => findAll(view, 'select').find(node => node.props['data-hunk-target'] !== undefined)
+  check(`${staged ? 'staged' : 'unstaged'} file mounts the hunk picker in the full app`, picker() !== undefined)
+  picker().props.onChange({ currentTarget: { value: '0' } })
+  view = await flush(GitApp, rootProps)
+  const action = staged ? 'unstage' : 'stage'
+  findAll(view, 'button').find(node => node.props['data-hunk-action'] === action).props.onClick()
+  view = await flush(GitApp, rootProps)
+  const method = staged ? 'write.unstageHunks' : 'write.stageHunks'
+  check(`${action} sends the selected fingerprint from the full app`,
+    mounted.rpc.calls.some(call => call.method === method && call.payload.hashes[0] === 'current-hunk' && call.payload.staged === staged))
+  if (!staged) {
+    picker().props.onChange({ currentTarget: { value: '0' } })
+    view = await flush(GitApp, rootProps)
+    findAll(view, 'button').find(node => node.props['data-hunk-action'] === 'discard').props.onClick()
+    view = await flush(GitApp, rootProps)
+    const dialog = walk(view).find(node => node.props?.role === 'alertdialog')
+    check('discarding a hunk waits for a confirmation dialog', dialog && !mounted.rpc.calls.some(call => call.method === 'write.discardHunks'))
+    findAll(dialog, 'button').find(node => textOf(node) === t('action.apply')).props.onClick()
+    view = await flush(GitApp, rootProps)
+    check('confirmed discard sends the fingerprint and confirmation token',
+      mounted.rpc.calls.some(call => call.method === 'write.discardHunks' && call.payload.confirm === true && call.payload.hashes[0] === 'current-hunk'))
+  }
+}
+
+console.log('\n--- hunk reads must match the preview content, not only its coordinates ---')
+{
+  runCleanups()
+  const { useFileHunks } = loadClientModule(source.replace('    return module.exports',
+    '    module.exports.useFileHunks = useFileHunks;\n    return module.exports'))
+  for (const contentHash of ['different-content-at-the-same-lines', undefined]) {
+    let model
+    const writes = []
+    const run = async (method, payload) => {
+      if (method === 'fileHunks') return { hunks: [{ header: '@@ -1,3 +1,4 @@', hash: 'current-unpreviewed-hunk', contentHash }] }
+      writes.push({ method, payload })
+      return { ok: true }
+    }
+    function HunkRaceFixture() {
+      model = useFileHunks({ enabled: true, repo: { root: ROOT }, path: 'src/index.js', staged: false,
+        hunks: DIFF.files[0].hunks, run, confirm: (_message, yes) => yes() })
+      return null
+    }
+    mount(HunkRaceFixture, {})
+    await flush(HunkRaceFixture, {})
+    check(contentHash ? 'a changed body at unchanged coordinates hides hunk actions' : 'a Host without preview digests cannot enable hunk writes', model.offer === false)
+    model.act('discard', 0)
+    model.act('stage', 0)
+    await flush(HunkRaceFixture, {})
+    check('unmatched content cannot be discarded or staged even through a retained handler', writes.length === 0)
+    runCleanups()
+  }
+}
+
+console.log('\n--- unavailable previews do not trigger hunk reads ---')
+{
+  runCleanups()
+  const { FileHunkActions } = loadClientModule(source.replace('    return module.exports',
+    '    module.exports.FileHunkActions = FileHunkActions;\n    return module.exports'))
+  for (const diff of [null, { hunks: [], files: [] }, { tooLarge: true, truncated: true, hunks: DIFF.hunks, files: DIFF.files }]) {
+    const calls = []
+    const props = { repo: { root: ROOT }, selection: { kind: 'file', section: 'unstaged', file: STATUS.files[1] },
+      fileDisplay: 'diff', diff, t, run: async method => { calls.push(method); return { hunks: [] } } }
+    mount(FileHunkActions, props)
+    await flush(FileHunkActions, props)
+    check('loading, empty and refused previews do not request fileHunks', calls.length === 0)
+    runCleanups()
+  }
+}
+
+console.log('\n--- skip is reachable and confirmed from both operation surfaces ---')
+{
+  const fixture = loadClientModule(source.replace('    return module.exports',
+    '    Object.assign(module.exports, { HeaderGitCluster, ConflictEditor, OperationPanel });\n    return module.exports'))
+  const operation = { kind: 'cherry-pick', step: null, total: null }
+  const conflictedFile = { path: 'conflict-skip.txt', kind: 'unmerged', index: 'U', worktree: 'U' }
+  let status = { ...STATUS, operation, files: [conflictedFile] }
+  const rpc = createRpcStub(healthyHandlers({
+    status: () => status,
+    operationReview: () => ({ hash: 'skip-review', operation, conflicts: 1, files: [] }),
+    'write.continueOperation': () => { status = { ...STATUS, operation: null, files: [] }; return { ok: true, message: 'skipped' } },
+  }))
+  const context = createClientContext({ connection: rpc })
+  fixture.apply(context.ctx)
+  const props = { connection: rpc, t, sessionId: 'skip-session', directory: ROOT }
+  mount(fixture.HeaderGitCluster, props)
+  let view = await flush(fixture.HeaderGitCluster, props)
+  findAll(view, 'button').find(node => node.props['data-chip'] === 'operation').props.onClick()
+  view = await flush(fixture.HeaderGitCluster, props)
+  const skip = () => findAll(view, 'button').find(node => node.props['data-op-action'] === 'skip')
+  check('the header operation panel offers skip despite unresolved conflicts', skip() !== undefined && !skip().props.disabled)
+  skip().props.onClick()
+  view = await flush(fixture.HeaderGitCluster, props)
+  const question = () => walk(view).find(node => node.props?.role === 'alertdialog' && hasText(node, t('pick.confirmSkip')))
+  check('header skip asks before writing', question() && !rpc.calls.some(call => call.method === 'write.continueOperation'))
+  findAll(question(), 'button').find(node => textOf(node) === t('action.cancel')).props.onClick()
+  view = await flush(fixture.HeaderGitCluster, props)
+  check('cancelling header skip writes nothing', !rpc.calls.some(call => call.method === 'write.continueOperation'))
+  skip().props.onClick(); view = await flush(fixture.HeaderGitCluster, props)
+  findAll(question(), 'button').find(node => textOf(node) === t('pick.skip')).props.onClick()
+  view = await flush(fixture.HeaderGitCluster, props)
+  check('confirmed header skip sends the reviewed operation and token', rpc.calls.some(call => call.method === 'write.continueOperation'
+    && call.payload.skip === true && call.payload.confirm === true && call.payload.reviewHash === 'skip-review'))
+  runCleanups()
+
+  const conflictOperation = { kind: 'rebase', step: 1, total: 2, stopReason: 'replay', canSkip: true }
+  let conflictStatus = { ...STATUS, operation: conflictOperation, files: [conflictedFile] }
+  const calls = []
+  const editorProps = { repo: { root: ROOT }, path: conflictedFile.path, t, run: async (method, payload) => {
+    calls.push({ method, payload })
+    if (method === 'status') return conflictStatus
+    if (method === 'operationReview') return { operation: conflictOperation, hash: 'editor-skip-review', conflicts: 1, files: [] }
+    if (method === 'conflictFile') return { hash: 'conflict-content', binary: false,
+      text: '<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n',
+      base: { text: 'base\n' }, ours: { text: 'ours\n' }, theirs: { text: 'theirs\n' } }
+    if (method === 'write.continueOperation') { conflictStatus = { ...STATUS, operation: null, files: [] }; return { ok: true } }
+    throw new Error('Unexpected method: ' + method)
+  } }
+  mount(fixture.ConflictEditor, editorProps)
+  view = await flush(fixture.ConflictEditor, editorProps)
+  skip().props.onClick(); view = await flush(fixture.ConflictEditor, editorProps)
+  check('the conflict editor asks before skipping unresolved content', question() && !calls.some(call => call.method.startsWith('write.')))
+  findAll(question(), 'button').find(node => textOf(node) === t('action.cancel')).props.onClick()
+  view = await flush(fixture.ConflictEditor, editorProps)
+  check('cancelling editor skip preserves the unresolved operation', !calls.some(call => call.method.startsWith('write.')) && !!skip())
+  skip().props.onClick(); view = await flush(fixture.ConflictEditor, editorProps)
+  findAll(question(), 'button').find(node => textOf(node) === t('pick.skip')).props.onClick()
+  view = await flush(fixture.ConflictEditor, editorProps)
+  check('confirmed editor skip bypasses the resolve-first check and sends its token', calls.some(call => call.method === 'write.continueOperation'
+    && call.payload.skip === true && call.payload.confirm === true && call.payload.reviewHash === 'editor-skip-review'))
+  runCleanups()
+  for (const kind of ['merge', 'am', 'revert']) {
+    const panelProps = { operation: { kind }, t, onSkip() {}, onContinue() {}, onAbort() {}, onClose() {} }
+    mount(fixture.OperationPanel, panelProps)
+    view = await flush(fixture.OperationPanel, panelProps)
+    check('skip availability matches Git support for ' + kind, !!skip() === (kind !== 'merge'))
+    runCleanups()
+  }
+  for (const operation of [
+    { kind: 'rebase', step: 1, total: 2, stopReason: 'edit', canSkip: false },
+    { kind: 'rebase', step: 1, total: 2 },
+    { kind: 'rebase', step: 1, total: 2, stopReason: 'replay', canSkip: true },
+  ]) {
+    const panelProps = { operation, t, onSkip() {}, onContinue() {}, onAbort() {}, onClose() {} }
+    mount(fixture.OperationPanel, panelProps)
+    view = await flush(fixture.OperationPanel, panelProps)
+    check('only confirmed replay stops offer rebase skip: ' + (operation.stopReason || 'unknown'), !!skip() === (operation.canSkip === true))
+    check('edit and unknown stops retain continue and abort', ['continue', 'abort'].every(action =>
+      findAll(view, 'button').some(node => node.props['data-op-action'] === action)))
+    runCleanups()
+  }
+}
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 if (failures > 0) {

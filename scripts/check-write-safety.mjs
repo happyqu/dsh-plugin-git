@@ -122,4 +122,37 @@ assert.equal((await repo.status({ force: true })).files.some(file => file.path =
 assert.equal(await readFile(join(nested, 'keep.txt'), 'utf8'), 'nested work\n')
 assert.equal(await readFile(join(linked, 'keep.txt'), 'utf8'), 'linked work\n')
 console.log('PASS nested repositories and linked worktrees survive mixed discards; local and shared ignore preserve content')
+
+// ---------------------------------------------------------------------------
+// Risk classification, asserted at the boundary that enforces it.
+//
+// The RPC layer demands a confirmation token for anything that is not `safe`, and
+// the class it reports is what the UI's dialog is built from. Two classifications
+// were wrong in ways a user would feel:
+//
+// - `rebase` sat in DESTRUCTIVE, so its confirmation read "discards your uncommitted
+//   changes" — describing something a rebase refuses to do.
+// - `cherryPick` was SAFE, so picking a commit onto the current branch produced a
+//   commit with no confirmation at all.
+//
+// Both are rewrites, and a rewrite must be reachable only after a human saw it.
+// ---------------------------------------------------------------------------
+{
+  for (const method of ['rebase', 'applyPlan', 'cherryPick', 'rewriteCommits']) {
+    const refused = await rpc.call('write.' + method, { root, confirm: false })
+    assert.equal(refused.ok, false, `${method} must not run without a token`)
+    assert.equal(refused.error.code, 'git/needs-confirmation', `${method} must be classified as a rewrite`)
+  }
+  // A plain stage stays safe: demanding confirmation for it would train the user to
+  // click through the dialogs that matter.
+  const plainStage = await rpc.call('write.stage', { root, paths: [] })
+  assert.notEqual(plainStage.error?.code, 'git/needs-confirmation')
+  const skip = await rpc.call('write.continueOperation', { root, kind: 'cherry-pick', skip: true })
+  assert.equal(skip.error?.code, 'git/needs-confirmation', 'skipping discards current resolutions and requires confirmation')
+  // Deleting an undo point only removes a marker; the commits survive in the reflog,
+  // so it needs no token either.
+  const undoDelete = await rpc.call('write.deleteUndoPoint', { root, ref: 'refs/dsh-rewrite/0-x' })
+  assert.notEqual(undoDelete.error?.code, 'git/needs-confirmation')
+  console.log('PASS rebase, cherry-pick and the planner demand confirmation while staging and undo deletion do not')
+}
 console.log('Write safety checks passed; fixture: ' + base)
