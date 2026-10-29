@@ -661,6 +661,16 @@ export function loadClientModule(source, options = {}) {
   const sandboxDocument = {
     /** Listener bookkeeping, so the menu component can register and remove. */
     listeners: new Map(),
+    /**
+     * The document root.
+     *
+     * The Desktop preload mirrors `process.platform` onto
+     * `html[data-platform]`, which is how the Client half tells a macOS desktop
+     * from a Windows one without consulting `navigator`. A real document always
+     * has this element, so the harness must too — otherwise the platform branch
+     * is unreachable here and a macOS regression cannot be caught.
+     */
+    documentElement: { dataset: {} },
     head: {
       /**
        * Record one injected stylesheet.

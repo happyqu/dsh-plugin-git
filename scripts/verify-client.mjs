@@ -4337,6 +4337,332 @@ console.log('\n--- same-named files stay distinguishable ---')
     JSON.stringify(dirs))
 }
 
+console.log('\n--- the workspace flow picks the right chooser for the platform ---')
+{
+  // The plugin shadows DSH's own native flow occupant, so it inherits that
+  // occupant's contract: a Desktop renderer has a window-owned dialog. WHICH
+  // chooser leads is platform-dependent — macOS Desktop is expected to show the
+  // Host's NSOpenPanel, while Windows and Linux Desktop keep the Electron sheet
+  // so a pick does not spawn a COM child process. Both orders have to be proven
+  // here; a suite that only ever runs the fallback would pass while macOS
+  // regressed.
+  const flowContext = createClientContext({ connection: createRpcStub(healthyHandlers()) })
+  const hostPicks = []
+  let resolved = null
+  flowContext.ctx.workspaces = { create: async ({ path }) => ({ workspaceId: 'ws-' + path }), list: { getSnapshot: () => ({ items: [] }), subscribe: () => () => {} } }
+  flowContext.ctx.uiWorkspace = {
+    pickDirectory: async () => { hostPicks.push('host'); return '/host/project' },
+    listDirectory: async () => { throw new Error('browse is not composed here') },
+    createDirectory: async () => { throw new Error('unused') },
+    openWorkspace: async () => {},
+  }
+  const plugin = loadClientModule(source)
+  plugin.apply(flowContext.ctx)
+  const flow = flowContext.registrations.find((entry) => entry.declaration.name === 'conversation.hero.workspace.directoryFlow')
+  check('the workspace flow registers for the hero slot', flow !== undefined)
+  const picked = []
+  let shown = null
+  const props = {
+    open: true, busy: false, t,
+    onPicked: (path) => picked.push(path), onCancel: () => {}, onError: (message) => { shown = message },
+  }
+  const clickLocal = (tree) => findAll(tree, 'button').find((node) => node.props['aria-label'] === t('clone.local')).props.onClick()
+
+  // Non-macOS Desktop: the Electron dialog answers and the Host is never asked.
+  globalThis.document.documentElement.dataset.platform = 'win32'
+  globalThis.__DSH_DIRECTORY_PICKER__ = { pick: async () => 'D:/shell/project' }
+  let tree2 = mount(flow.Component, props).tree
+  clickLocal(tree2)
+  tree2 = await flush(flow.Component, props)
+  check('a Windows Desktop pick reports the Electron dialog result', picked[0] === 'D:/shell/project', JSON.stringify(picked))
+  check('the Host chooser is not reached on Windows while the shell dialog exists', hostPicks.length === 0, JSON.stringify(hostPicks))
+
+  // macOS Desktop: the Host NSOpenPanel leads, even though a bridge is present.
+  globalThis.document.documentElement.dataset.platform = 'darwin'
+  hostPicks.length = 0; picked.length = 0
+  tree2 = mount(flow.Component, props).tree
+  clickLocal(tree2)
+  tree2 = await flush(flow.Component, props)
+  check('a macOS Desktop pick opens the Host NSOpenPanel', picked[0] === '/host/project' && hostPicks.length === 1, JSON.stringify(picked))
+  check('the Electron dialog is not consulted on macOS when the Host panel answered', picked[0] !== 'D:/shell/project')
+
+  // A Host panel that cannot start must not strand the button on macOS.
+  delete globalThis.document.documentElement.dataset.platform
+  delete globalThis.__DSH_DIRECTORY_PICKER__
+  hostPicks.length = 0; picked.length = 0
+  tree2 = mount(flow.Component, props).tree
+  clickLocal(tree2)
+  tree2 = await flush(flow.Component, props)
+  check('without any shell the Host chooser answers', picked[0] === '/host/project' && hostPicks.length === 1, JSON.stringify(picked))
+
+  // A pending chooser disables the choices, and it must do so without adding
+  // explanation text to the dialog: the notice is the highlight itself.
+  globalThis.__DSH_DIRECTORY_PICKER__ = { pick: () => new Promise((resolve) => { resolved = resolve }) }
+  picked.length = 0
+  tree2 = mount(flow.Component, props).tree
+  clickLocal(tree2)
+  tree2 = await flush(flow.Component, props)
+  check('the choices are disabled while the chooser is pending',
+    findAll(tree2, 'button').filter((node) => node.props['aria-label'] === t('clone.local')).every((node) => node.props.disabled))
+  check('no waiting notice is added to the dialog',
+    !hasText(tree2, '正在等待') && !hasText(tree2, 'Waiting for a directory'),
+    textOf(tree2).slice(0, 300))
+  resolved('/Users/me/late')
+  tree2 = await flush(flow.Component, props)
+  check('the late answer still lands after the wait',
+    picked[0] === '/Users/me/late' && findAll(tree2, 'button').some((node) => node.props['aria-label'] === t('clone.local') && !node.props.disabled),
+    JSON.stringify(picked))
+  delete globalThis.__DSH_DIRECTORY_PICKER__
+}
+
+console.log('\n--- a hung macOS folder picker has cancel and manual recovery ---')
+{
+  const context = createClientContext({ connection: createRpcStub(healthyHandlers()) })
+  let resolveHost, rejectHost, localCalls = 0
+  const picked = [], errors = []
+  context.ctx.workspaces = { create: async () => ({ workspaceId: 'ws' }), list: { getSnapshot: () => ({ items: [] }), subscribe: () => () => {} } }
+  context.ctx.uiWorkspace = {
+    pickDirectory: () => new Promise((resolve, reject) => { resolveHost = resolve; rejectHost = reject }),
+    listDirectory: async () => { throw new Error('unused') }, createDirectory: async () => {}, openWorkspace: async () => {},
+  }
+  loadClientModule(source).apply(context.ctx)
+  globalThis.document.documentElement.dataset.platform = 'darwin'
+  globalThis.__DSH_DIRECTORY_PICKER__ = { pick: async () => { localCalls++; return '/unexpected' } }
+  const flow = context.registrations.find(entry => entry.declaration.name === 'conversation.hero.workspace.directoryFlow')
+  const picker = context.registrations.find(entry => entry.declaration.id === 'git-directory-picker')
+  const props = { open: true, busy: false, t, onPicked: path => picked.push(path), onCancel() {}, onError: message => errors.push(message) }
+  const clickLocal = tree => findAll(tree, 'button').find(node => node.props['aria-label'] === t('clone.local')).props.onClick()
+  let flowTree = mount(flow.Component, props).tree
+  clickLocal(flowTree)
+  let pickerTree = await flush(picker.Component, { t })
+  check('a pending Host chooser exposes recovery controls', hasText(pickerTree, t('clone.pickerWaiting')) && findAll(pickerTree, 'input').length === 1)
+  const cancel = findAll(pickerTree, 'button').find(node => hasText(node, t('action.cancel')))
+  check('cancel stays enabled while the Host never answers', cancel && !cancel.props.disabled)
+  cancel.props.onClick()
+  flowTree = await flush(flow.Component, props)
+  pickerTree = await flush(picker.Component, { t })
+  check('cancelling the hung Host unlocks the workspace choices', findAll(flowTree, 'button').every(node => !node.props.disabled) && findAll(pickerTree, 'form').length === 0)
+  rejectHost(new Error('late Host failure'))
+  await flush(flow.Component, props)
+  check('a late Host failure opens no fallback and reports no error', localCalls === 0 && errors.length === 0 && picked.length === 0)
+  clickLocal(flowTree)
+  pickerTree = await flush(picker.Component, { t })
+  findAll(pickerTree, 'input')[0].props.onChange({ target: { value: '~/projects' } })
+  pickerTree = await flush(picker.Component, { t })
+  check('manual recovery rejects a relative or tilde path', findAll(pickerTree, 'button').some(node => node.props.type === 'submit' && node.props.disabled))
+  findAll(pickerTree, 'input')[0].props.onChange({ target: { value: '/Users/me/项目' } })
+  pickerTree = await flush(picker.Component, { t })
+  findAll(pickerTree, 'form')[0].props.onSubmit({ preventDefault() {} })
+  flowTree = await flush(flow.Component, props)
+  check('a manual path completes the request while the Host is still pending', picked.length === 1 && picked[0] === '/Users/me/项目' && findAll(flowTree, 'button').every(node => !node.props.disabled))
+  resolveHost('/late/native/path')
+  await flush(flow.Component, props)
+  check('a late native selection cannot overwrite the manual answer', picked.length === 1 && localCalls === 0)
+  delete globalThis.__DSH_DIRECTORY_PICKER__
+  context.ctx.uiWorkspace.pickDirectory = async () => { throw new Error('browse only') }
+  context.ctx.uiWorkspace.listDirectory = async () => ({ path: '/home/projects', home: '/home', crumbs: [], entries: [], truncated: false })
+  clickLocal(flowTree)
+  pickerTree = await flush(picker.Component, { t })
+  check('a browse-only Host still opens the directory browser', findAll(pickerTree, 'div').some(node => node.props.className === 'dshgit-directory-list'))
+  findAll(pickerTree, 'button').find(node => hasText(node, t('clone.useDirectory'))).props.onClick()
+  flowTree = await flush(flow.Component, props)
+  check('selecting a browsed directory still completes the request', picked.length === 2 && picked[1] === '/home/projects')
+  context.ctx.uiWorkspace.pickDirectory = () => new Promise((resolve, reject) => { rejectHost = reject })
+  clickLocal(flowTree)
+  await flush(picker.Component, { t })
+  context.effects.find(effect => effect?.label === 'git: directory picker').result()
+  await flush(flow.Component, props)
+  rejectHost(new Error('late failure after disposal'))
+  await flush(flow.Component, props)
+  pickerTree = await flush(picker.Component, { t })
+  check('disposal settles the hung request and ignores late failures', errors.length === 1 && errors[0] === t('clone.pickerClosed') && picked.length === 2 && findAll(pickerTree, 'form').length === 0)
+  delete globalThis.document.documentElement.dataset.platform
+  delete globalThis.__DSH_DIRECTORY_PICKER__
+}
+
+console.log('\n--- a rejected destination explains itself instead of only dimming ---')
+{
+  // Every fixture path in this suite is a Windows drive path; the mistake this
+  // guards is the macOS one (`~/projects`), which looks like a filled-in field.
+  // The dialogs must name the problem rather than leaving a dead button.
+  //
+  // The project dialog owns its own open/closed store, so it is reached the way
+  // an operator reaches it: click 新建项目 in the add-workspace flow first. Both
+  // registrations share this activation's closure.
+  const projectContext = createClientContext({ connection: createRpcStub(healthyHandlers({
+    projectPreferences: () => ({ parent: '', name: '' }),
+  })) })
+  projectContext.ctx.workspaces = { create: async () => ({ workspaceId: 'ws' }), list: { getSnapshot: () => ({ items: [] }), subscribe: () => () => {} } }
+  projectContext.ctx.uiWorkspace = { pickDirectory: async () => '/Users/me', listDirectory: async () => null, createDirectory: async () => {}, openWorkspace: async () => {} }
+  const projectPlugin = loadClientModule(source)
+  projectPlugin.apply(projectContext.ctx)
+  const flowEntry = projectContext.registrations.find((entry) => entry.declaration.name === 'conversation.hero.workspace.directoryFlow')
+  const projectEntry = projectContext.registrations.find((entry) => entry.declaration.id === 'git-new-project')
+  check('the project dialog and the flow are registered together', flowEntry !== undefined && projectEntry !== undefined)
+  let flowTree = mount(flowEntry.Component, { open: true, busy: false, t, onPicked() {}, onCancel() {}, onError() {} }).tree
+  findAll(flowTree, 'button').find((node) => node.props['aria-label'] === t('project.title')).props.onClick()
+  flowTree = await flush(flowEntry.Component, { open: true, busy: false, t, onPicked() {}, onCancel() {}, onError() {} })
+  let tree3 = await flush(projectEntry.Component, { t })
+  const parentField = findAll(tree3, 'input').find((node) => node.props.id === 'dshgit-project-parent')
+  const nameField = findAll(tree3, 'input').find((node) => node.props.id !== 'dshgit-project-parent')
+  check('the project dialog opened with its parent field', parentField !== undefined && nameField !== undefined,
+    textOf(tree3).slice(0, 300))
+  nameField.props.onChange({ target: { value: 'app' } })
+  parentField.props.onChange({ target: { value: '~/projects' } })
+  tree3 = await flush(projectEntry.Component, { t })
+  check('a tilde path is named as not expanded', hasText(tree3, t('clone.problem.tilde')), textOf(tree3).slice(0, 400))
+  check('the create button stays disabled for a rejected destination',
+    findAll(tree3, 'button').filter((node) => node.props.type === 'submit').every((node) => node.props.disabled))
+  parentField.props.onChange({ target: { value: 'relative/dir' } })
+  tree3 = await flush(projectEntry.Component, { t })
+  check('a relative path explains that it must be absolute', hasText(tree3, t('clone.problem.relative')))
+  parentField.props.onChange({ target: { value: '/Users/me' } })
+  tree3 = await flush(projectEntry.Component, { t })
+  check('correcting the path clears the explanation and enables create',
+    !hasText(tree3, t('clone.problem.relative')) && !hasText(tree3, t('clone.problem.tilde')) &&
+      findAll(tree3, 'button').filter((node) => node.props.type === 'submit').every((node) => node.props.disabled === false))
+}
+console.log('PASS destination problems are explained and corrected paths recover')
+
+// The clone dialog reaches the same helper through a different form (a URL that
+// seeds the folder name), so it gets its own pass rather than being assumed.
+{
+  const cloneContext = createClientContext({ connection: createRpcStub(healthyHandlers({
+    projectPreferences: () => ({ parent: '' }),
+  })) })
+  cloneContext.ctx.workspaces = { create: async () => ({ workspaceId: 'ws' }), list: { getSnapshot: () => ({ items: [] }), subscribe: () => () => {} } }
+  cloneContext.ctx.uiWorkspace = { pickDirectory: async () => '/Users/me', listDirectory: async () => null, createDirectory: async () => {}, openWorkspace: async () => {} }
+  loadClientModule(source).apply(cloneContext.ctx)
+  const flowEntry = cloneContext.registrations.find((entry) => entry.declaration.name === 'conversation.hero.workspace.directoryFlow')
+  const cloneEntry = cloneContext.registrations.find((entry) => entry.declaration.id === 'git-clone-workspace')
+  const flowProps = { open: true, busy: false, t, onPicked() {}, onCancel() {}, onError() {} }
+  mount(flowEntry.Component, flowProps)
+  findAll(mount(flowEntry.Component, flowProps).tree, 'button').find((node) => node.props['aria-label'] === t('clone.entry')).props.onClick()
+  await flush(flowEntry.Component, flowProps)
+  let tree4 = await flush(cloneEntry.Component, { t })
+  const parentInput = findAll(tree4, 'input').find((node) => node.props.id === 'dshgit-clone-parent')
+  check('the clone dialog opened with its parent field', parentInput !== undefined, textOf(tree4).slice(0, 300))
+  // A URL seeds the folder name, so only the path is wrong here.
+  const urlInput = findAll(tree4, 'input')[0]
+  urlInput.props.onChange({ target: { value: 'https://github.com/o/app.git' } })
+  parentInput.props.onChange({ target: { value: '~/projects' } })
+  tree4 = await flush(cloneEntry.Component, { t })
+  check('the clone dialog explains a tilde path too', hasText(tree4, t('clone.problem.tilde')), textOf(tree4).slice(0, 400))
+  findAll(tree4, 'input').find((node) => node.props.id === 'dshgit-clone-parent').props.onChange({ target: { value: '/Users/me/projects' } })
+  tree4 = await flush(cloneEntry.Component, { t })
+  check('fixing the clone path clears the explanation',
+    !hasText(tree4, t('clone.problem.tilde')) && !hasText(tree4, t('clone.problem.relative')))
+}
+console.log('PASS the clone dialog explains the same problems')
+
+console.log('\n--- a changelist folds and stays searchable, including mid-write ---')
+{
+  // The commit popover's changelist rows are the one place a user meets a
+  // list he did not create: "默认 ●" and the lists beside it. Two separate
+  // defects lived here. A live query forced every group open, so the chevron
+  // wrote `expand: false` and nothing moved; and the chevron was disabled while
+  // any write was in flight, taking away the only way to tidy the list during a
+  // commit. Folding is view state, so neither is acceptable.
+  const foldFile = { path: 'src/index.js', originalPath: null, index: '.', worktree: 'M', staged: false, kind: 'ordinary', added: 2, deleted: 1, binary: false }
+  const skipFile = { path: 'docs/待提交.md', originalPath: null, index: '.', worktree: 'M', staged: false, kind: 'ordinary', added: 1, deleted: 0, binary: false }
+  let lists = { version: 3, mode: 'lists', fileLayout: 'tree', active: 'default', draftList: 'default',
+    lists: [{ id: 'default', name: '默认', description: '', draft: '', expanded: true },
+      { id: 'skip', name: '不提交', description: '', draft: '', expanded: true }],
+    assignments: { 'src/index.js': 'default', 'docs/待提交.md': 'skip' }, selected: ['src/index.js'], chunks: {} }
+  let releaseCommit
+  tree = await renderChips(healthyHandlers({
+    status: () => ({ ...STATUS, total: 2, files: [foldFile, skipFile] }),
+    changelists: () => lists,
+    updateChangelist: (payload) => {
+      if (payload.action === 'expand') lists = { ...lists, version: lists.version + 1,
+        lists: lists.lists.map((list) => list.id === payload.id ? { ...list, expanded: payload.expanded } : list) }
+      return lists
+    },
+    // In changelist mode the popover commits an explicit PATH scope, so that is
+    // the write that must stay pending for the fold to be tried mid-flight.
+    'write.commitPaths': () => new Promise((resolve) => { releaseCommit = resolve }),
+    'write.commit': () => new Promise((resolve) => { releaseCommit = resolve }),
+  }))
+  findAll(tree, 'button').find((node) => node.props['data-chip'] === 'changes')
+    .props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 900, bottom: 40 }) } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const popover = () => walk(tree).find((node) => node.props?.['data-popover'] === 'commit')
+  const headOf = (id) => walk(popover()).find((node) => node.props?.['data-changelist-id'] === id)
+  const foldOf = (id) => findAll(headOf(id), 'button').find((node) => node.props['aria-expanded'] !== undefined)
+  const rowsOf = () => walk(popover()).filter((node) => node.props?.['data-file-path']).map((node) => node.props['data-file-path'])
+  check('both changelists are listed with their files',
+    headOf('default') !== undefined && headOf('skip') !== undefined &&
+      rowsOf().includes('src/index.js') && rowsOf().includes('docs/待提交.md'), JSON.stringify(rowsOf()))
+
+  // Search: the matching list opens on its match, the list with nothing to show
+  // does not open onto an empty gap.
+  const searchInput = () => findAll(popover(), 'input').find((node) => node.props.type === 'search')
+  searchInput().props.onChange({ currentTarget: { value: 'src' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('a query narrows the lists without hiding their headers',
+    headOf('default') !== undefined && headOf('skip') !== undefined, textOf(popover()).slice(0, 240))
+
+  // Folding must work WHILE the query is active — this is the regression.
+  foldOf('default').props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('a list folds while a search is active', foldOf('default').props['aria-expanded'] === false &&
+    !rowsOf().includes('src/index.js'), JSON.stringify({ expanded: foldOf('default').props['aria-expanded'], rows: rowsOf() }))
+  foldOf('default').props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('the same list unfolds again with the search still active',
+    foldOf('default').props['aria-expanded'] === true && rowsOf().includes('src/index.js'))
+
+  // A fold belongs to the query it was chosen under. Typing a different search
+  // asks a different question, so the lists it matched start from their default
+  // instead of inheriting a fold the user picked for the previous one.
+  foldOf('default').props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('a list can be folded again under the current query', foldOf('default').props['aria-expanded'] === false)
+  searchInput().props.onChange({ currentTarget: { value: '待提交' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('a new query starts from a clean fold state',
+    foldOf('skip').props['aria-expanded'] === true && rowsOf().includes('docs/待提交.md'),
+    JSON.stringify({ expanded: foldOf('skip').props['aria-expanded'], rows: rowsOf() }))
+  searchInput().props.onChange({ currentTarget: { value: '' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+
+  // A search for a list NAME shows that list's files rather than an empty body
+  // with a 0/N counter, which reads as "this list is empty".
+  searchInput().props.onChange({ currentTarget: { value: '不提交' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('a search matching a list name still shows that list\'s files',
+    rowsOf().includes('docs/待提交.md') && !rowsOf().includes('src/index.js'), JSON.stringify(rowsOf()))
+  searchInput().props.onChange({ currentTarget: { value: '' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+
+  // Mid-write: the fold is view state and must stay usable. The list is opened
+  // first, because earlier folds in this block were persisted through
+  // `updateChangelist` — the same write a real Host would have seen.
+  if (foldOf('default').props['aria-expanded'] !== true) {
+    foldOf('default').props.onClick()
+    tree = await flush(GitApp, { connection: mounted.rpc, t })
+  }
+  findAll(popover(), 'textarea').find((node) => node.props.placeholder === t('commit.placeholderMessage'))
+    .props.onChange({ currentTarget: { value: 'feat: fold during commit' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(popover(), 'button').find((node) => String(node.props.className).includes('dshgit-commit-primary')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('the commit is in flight before the fold is tried',
+    typeof releaseCommit === 'function' &&
+      mounted.rpc.calls.some((call) => call.method === 'write.commitPaths' || call.method === 'write.commit' || call.method === 'operationStart'),
+    JSON.stringify(mounted.rpc.calls.filter((call) => call.method.startsWith('write.')).map((call) => call.method)))
+  check('the changelist chevron is not disabled by an unrelated write', foldOf('default').props.disabled !== true)
+  foldOf('default').props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('a running commit does not make the changelist un-foldable',
+    foldOf('default').props['aria-expanded'] === false && !rowsOf().includes('src/index.js'),
+    JSON.stringify({ expanded: foldOf('default')?.props['aria-expanded'], rows: rowsOf() }))
+  releaseCommit({ ok: true, code: 0, message: '提交成功', stdout: '' })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  tree = await renderApp()
+}
+console.log('PASS a changelist folds and stays searchable, including mid-write')
+
 console.log(`\n${checks - failures}/${checks} checks passed`)
 if (failures > 0) {
   console.error(`${failures} FAILED`)
