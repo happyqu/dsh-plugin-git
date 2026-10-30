@@ -4425,13 +4425,33 @@ console.log('\n--- a hung macOS folder picker has cancel and manual recovery ---
 {
   const context = createClientContext({ connection: createRpcStub(healthyHandlers()) })
   let resolveHost, rejectHost, localCalls = 0
-  const picked = [], errors = []
   context.ctx.workspaces = { create: async () => ({ workspaceId: 'ws' }), list: { getSnapshot: () => ({ items: [] }), subscribe: () => () => {} } }
   context.ctx.uiWorkspace = {
     pickDirectory: () => new Promise((resolve, reject) => { resolveHost = resolve; rejectHost = reject }),
     listDirectory: async () => { throw new Error('unused') }, createDirectory: async () => {}, openWorkspace: async () => {},
   }
   loadClientModule(source).apply(context.ctx)
+  // The recovery dialog waits for evidence that no native panel is coming, so
+  // the suite owns that grace period: intercept only its delay, and drive the
+  // foreground events that decide whether the wait is over. This is installed
+  // before the first pick, or the first wait would run on a real timer.
+  const GRACE = 2000
+  const realTimeout = globalThis.setTimeout, realClear = globalThis.clearTimeout
+  const grace = new Map()
+  let graceSeq = 0
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (delay !== GRACE) return realTimeout(callback, delay, ...args)
+    const id = --graceSeq; grace.set(id, callback); return id
+  }
+  globalThis.clearTimeout = id => { if (grace.has(id)) grace.delete(id); else realClear(id) }
+  const runGrace = async () => {
+    const entry = grace.entries().next().value
+    if (entry === undefined) return false
+    grace.delete(entry[0]); await entry[1](); return true
+  }
+  const blur = () => (window.listeners.get('blur') ?? []).slice().forEach(listener => listener())
+  const focus = () => (window.listeners.get('focus') ?? []).slice().forEach(listener => listener())
+  const picked = [], errors = []
   globalThis.document.documentElement.dataset.platform = 'darwin'
   globalThis.__DSH_DIRECTORY_PICKER__ = { pick: async () => { localCalls++; return '/unexpected' } }
   const flow = context.registrations.find(entry => entry.declaration.name === 'conversation.hero.workspace.directoryFlow')
@@ -4441,6 +4461,20 @@ console.log('\n--- a hung macOS folder picker has cancel and manual recovery ---
   let flowTree = mount(flow.Component, props).tree
   clickLocal(flowTree)
   let pickerTree = await flush(picker.Component, { t })
+  check('the recovery dialog stays out of the way while the native panel may still answer',
+    !hasText(pickerTree, t('clone.pickerWaiting')) && findAll(pickerTree, 'input').length === 0 && grace.size === 1,
+    `grace=${grace.size} text=${textOf(pickerTree).slice(0, 120)}`)
+  blur()
+  check('a native panel taking the foreground cancels the pending reveal', await runGrace() === false && grace.size === 0)
+  focus()
+  document.hasFocus = () => false
+  check('a page that is not the foreground is not offered the recovery dialog',
+    await runGrace() === true && grace.size === 0 &&
+    !hasText(await flush(picker.Component, { t }), t('clone.pickerWaiting')))
+  delete document.hasFocus
+  check('returning to the page re-arms the wait', await runGrace() === false && (focus(), grace.size === 1))
+  check('the recovery dialog reveals itself once the page has kept the foreground', await runGrace() === true)
+  pickerTree = await flush(picker.Component, { t })
   check('a pending Host chooser exposes recovery controls', hasText(pickerTree, t('clone.pickerWaiting')) && findAll(pickerTree, 'input').length === 1)
   const cancel = findAll(pickerTree, 'button').find(node => hasText(node, t('action.cancel')))
   check('cancel stays enabled while the Host never answers', cancel && !cancel.props.disabled)
@@ -4452,6 +4486,8 @@ console.log('\n--- a hung macOS folder picker has cancel and manual recovery ---
   await flush(flow.Component, props)
   check('a late Host failure opens no fallback and reports no error', localCalls === 0 && errors.length === 0 && picked.length === 0)
   clickLocal(flowTree)
+  await flush(picker.Component, { t })
+  await runGrace()
   pickerTree = await flush(picker.Component, { t })
   findAll(pickerTree, 'input')[0].props.onChange({ target: { value: '~/projects' } })
   pickerTree = await flush(picker.Component, { t })
@@ -4482,6 +4518,16 @@ console.log('\n--- a hung macOS folder picker has cancel and manual recovery ---
   await flush(flow.Component, props)
   pickerTree = await flush(picker.Component, { t })
   check('disposal settles the hung request and ignores late failures', errors.length === 1 && errors[0] === t('clone.pickerClosed') && picked.length === 2 && findAll(pickerTree, 'form').length === 0)
+  try {
+    clickLocal(flowTree)
+    await flush(picker.Component, { t })
+    check('the pending reveal releases its timer', grace.size === 1)
+    runCleanups()
+    check('unmounting releases the recovery timer', grace.size === 0)
+  } finally {
+    runCleanups()
+    globalThis.setTimeout = realTimeout; globalThis.clearTimeout = realClear
+  }
   delete globalThis.document.documentElement.dataset.platform
   delete globalThis.__DSH_DIRECTORY_PICKER__
 }
