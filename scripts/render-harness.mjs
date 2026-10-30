@@ -802,6 +802,8 @@ export function createClientContext(options = {}) {
     },
   }
   const dictionaries = new Map()
+  /** Injections held back by `deferInjections`; see {@link runDeferredInjections}. */
+  const deferred = []
 
   const locale = options.locale ?? {
     /**
@@ -835,26 +837,73 @@ export function createClientContext(options = {}) {
   const slots = {
     /**
      * Register a slot entry, recording it for assertions.
+     *
+     * The disposer removes the entry, as the real registry does: a plugin that
+     * hands a seat back must be observable doing it.
+     *
      * @param declaration - the slot declaration.
      * @param Component - the rendered component.
      * @returns a disposer.
      */
     register(declaration, Component) {
-      registrations.push({ declaration, Component })
-      return () => {}
+      const entry = { declaration, Component }
+      registrations.push(entry)
+      let removed = false
+      return () => {
+        if (removed) return
+        removed = true
+        const index = registrations.indexOf(entry)
+        if (index >= 0) registrations.splice(index, 1)
+      }
     },
     /**
      * Run an injection callback, as the real slot service does when the target
      * slot exists. Names are treated as present unless listed in `missing`.
-     * @param _key - the slot key.
+     * The returned disposer tears the contribution down, which is how a plugin
+     * hands a seat back to the occupant it was shadowing.
+     *
+     * With `deferInjections`, the body is queued instead of run: that is the
+     * case a plugin must survive — the slot it targets is declared by a later
+     * package — and it is also the case that exposes a loop variable captured
+     * by a callback that runs after the loop has finished.
+     * @param key - the slot key.
      * @param callback - the injection body.
      * @returns the effect the body returned.
      */
-    inject(_key, callback) {
+    inject(key, callback) {
+      if (options.deferInjections === true) {
+        const pending = { key, callback, effect: undefined, disposed: false }
+        deferred.push(pending)
+        return () => {
+          pending.disposed = true
+          const effect = pending.effect
+          if (typeof effect === 'function') effect()
+          else if (effect) for (const dispose of effect) dispose()
+          pending.effect = undefined
+        }
+      }
       const effect = callback()
       effects.push(effect)
-      return () => {}
+      return () => {
+        if (typeof effect === 'function') { effect(); return }
+        if (effect) for (const dispose of effect) dispose()
+      }
     },
+  }
+
+  /**
+   * Run every queued injection whose slot has since been declared, in order.
+   * @returns the number of injections that ran.
+   */
+  function runDeferredInjections() {
+    let ran = 0
+    for (const pending of deferred.splice(0, deferred.length)) {
+      if (pending.disposed) continue
+      pending.effect = pending.callback()
+      effects.push(pending.effect)
+      ran++
+    }
+    return ran
   }
 
   const ctx = {
@@ -886,7 +935,7 @@ export function createClientContext(options = {}) {
     },
   }
 
-  return { ctx, registrations, effects, dictionaries, connection }
+  return { ctx, registrations, effects, dictionaries, connection, runDeferredInjections }
 }
 
 /**

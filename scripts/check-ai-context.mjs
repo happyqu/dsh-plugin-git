@@ -137,7 +137,14 @@ await store.update({ aiExcludePatterns: 'dist/**\n!dist/hand.js' })
 assert.equal((await new ConfigStore({ path: store.path }).load()).aiExcludePatterns, 'dist/**\n!dist/hand.js')
 assert.equal(sanitize({ aiExcludePatterns: 12 }).aiExcludePatterns, DEFAULT_CONFIG.aiExcludePatterns)
 assert.equal(sanitize({ aiExcludePatterns: '' }).aiExcludePatterns, DEFAULT_CONFIG.aiExcludePatterns)
-console.log('PASS glob matching and persistent, validated AI exclusion settings')
+// The add-workspace switch defaults on (this plugin's dialog) and has to survive
+// a round trip; a Host that dropped the key would silently revert the choice.
+await store.update({ workspaceAddDialog: false })
+assert.equal((await new ConfigStore({ path: store.path }).load()).workspaceAddDialog, false)
+assert.equal(sanitize({ workspaceAddDialog: 'no' }).workspaceAddDialog, DEFAULT_CONFIG.workspaceAddDialog)
+await store.update({ workspaceAddDialog: true })
+assert.equal((await new ConfigStore({ path: store.path }).load()).workspaceAddDialog, true)
+console.log('PASS glob matching and persistent, validated AI exclusion and add-workspace settings')
 
 config.aiExcludePatterns = DEFAULT_CONFIG.aiExcludePatterns
 const cacheScope = { root, paths: [many[0]] }

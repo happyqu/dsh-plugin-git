@@ -185,8 +185,8 @@ const COMMIT_DETAIL = {
 }
 
 const CONFIG = {
-  gitPath: '', defaultRepo: '', similarityThreshold: 50, autoBlame: true, blameChunkLines: 2000,
-  historyLimit: 300, aiEnabled: true, aiProvider: '', aiModel: '', aiExcludePatterns: '', locale: '',
+  gitPath: '', defaultRepo: '', similarityThreshold: 50, autoFetch: false, autoFetchInterval: 5,
+  workspaceAddDialog: true, aiEnabled: true, aiProvider: '', aiModel: '', aiExcludePatterns: '', locale: '',
 }
 
 const DIAGNOSTICS = {
@@ -1813,19 +1813,72 @@ console.log('\n--- settings tab ---')
     hasText(tree, 'd:/Program Files/Git/cmd/git.exe'), textOf(tree).slice(0, 300))
   check('settings renders the rename threshold field',
     findWhere(tree, (props) => props.value === 50 && props.className === 'dshgit-input').length === 1)
-  // The General page holds a single boolean (`autoBlame`); the other settings are
-  // path/number fields. A count of 2+ was asserted when several booleans happened
-  // to share this page, which is no longer the layout.
   check('settings renders a checkbox for its boolean option',
     findAll(tree, 'input').filter((node) => node.props.type === 'checkbox').length >= 1,
     String(findAll(tree, 'input').filter((node) => node.props.type === 'checkbox').length))
-  // Settings grew from three groups to five: the repository scope and Git LFS each
-  // gained a page of their own. Assert the group ids the nav actually offers.
-  check('settings sidebar offers the five groups',
-    findAll(tree, 'button').filter((node) => String(node.props.className).includes('dshgit-rowbtn'))
-      .map((node) => textOf(node)).join(',') ===
-      [t('settings.general'), t('settings.currentRepo'), t('settings.ai'), t('lfs.title'), t('settings.diagnostics')].join(','),
-    JSON.stringify(findAll(tree, 'button').filter((n) => String(n.props.className).includes('dshgit-rowbtn')).map(textOf)))
+  // Groups follow SCOPE, so "what does changing this affect?" is answerable
+  // before the control is touched. Sync is its own group because background
+  // fetching is not a property of this device or of one repository.
+  const navLabels = () => findAll(tree, 'button').filter((node) => String(node.props.className).includes('dshgit-rowbtn')).map((node) => textOf(node))
+  check('settings sidebar offers one group per scope', navLabels().join(',') ===
+    [t('settings.general'), t('settings.sync'), t('settings.currentRepo'), t('settings.ai'), t('lfs.title'), t('settings.diagnostics')].join(','),
+    JSON.stringify(navLabels()))
+  // Every group renders named cards, so a page reads as blocks with headings
+  // rather than a flat list whose items belong to different scopes.
+  const heads = () => findAll(tree, 'div').filter((node) => node.props.className === 'dshgit-cardhead').map((node) => textOf(node))
+  check('the general page names each block', heads().length >= 2 &&
+    [t('settings.groupGit'), t('settings.groupInterface'), t('settings.groupDiff')].every((label) => hasText(tree, label)),
+    JSON.stringify(heads()))
+  check('the general page holds no repository-scoped control',
+    !hasText(tree, t('identity.title')) && !hasText(tree, t('auth.help')),
+    textOf(tree).slice(0, 400))
+  // The two removed fields were never read by any code path: a page that offers
+  // them promises behaviour that does not exist.
+  check('settings no longer offers controls with no effect',
+    !hasText(tree, t('label.blameChunk')) && !hasText(tree, t('label.historyLimit')),
+    textOf(tree).slice(0, 500))
+  // The rename threshold is the one numeric setting whose direction is easy to
+  // state backwards, and its reach is narrower than "rename detection" implies:
+  // only the patch honours it, while the list badge uses Git's own default. Both
+  // facts are on the page so neither has to be inferred.
+  check('the rename threshold explains which direction is stricter', hasText(tree, t('settings.groupDiffHint')))
+  check('the rename threshold states that it does not move the list badge',
+    hasText(tree, t('settings.groupDiffScope')), textOf(tree).slice(0, 500))
+}
+
+console.log('\n--- sync settings are their own scope ---')
+{
+  findAll(tree, 'button').find((node) => textOf(node) === t('settings.sync')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('the sync page carries background fetch and nothing else',
+    hasText(tree, t('settings.autoFetch')) && hasText(tree, t('settings.autoFetchInterval')) &&
+      !hasText(tree, t('settings.workspaceAddDialog')) && !hasText(tree, t('label.gitPath')),
+    textOf(tree).slice(0, 400))
+  check('the sync page names its block', hasText(tree, t('settings.groupFetch')))
+  findAll(tree, 'button').find((node) => textOf(node) === t('settings.general')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+}
+
+console.log('\n--- the repository page composes every repo-scoped block ---')
+{
+  // Identity, authentication and ignore rules are all stored IN one repository,
+  // so they share a page instead of being split across "general" and "current
+  // repository" — which was the confusing boundary this layout replaced.
+  findAll(tree, 'button').find((node) => textOf(node) === t('settings.currentRepo')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('the repository page names the repository it scopes',
+    hasText(tree, ROOT) && hasText(tree, t('settings.currentRepo')), textOf(tree).slice(0, 300))
+  check('identity, authentication and ignore rules live on it together',
+    hasText(tree, t('identity.title')) && hasText(tree, t('auth.help')) && hasText(tree, t('ignore.title')),
+    textOf(tree).slice(0, 600))
+  check('it does not repeat the device-scoped controls',
+    !hasText(tree, t('label.gitPath')) && !hasText(tree, t('settings.workspaceAddDialog')),
+    textOf(tree).slice(0, 600))
+  check('the page has exactly one heading, not one per block',
+    findAll(tree, 'div').filter((node) => node.props.className === 'dshgit-ignore-heading').length === 1,
+    String(findAll(tree, 'div').filter((node) => node.props.className === 'dshgit-ignore-heading').length))
+  findAll(tree, 'button').find((node) => textOf(node) === t('settings.general')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
 }
 
 console.log('\n--- AI settings expose independent diff exclusions ---')
@@ -4341,6 +4394,100 @@ console.log('\n--- same-named files stay distinguishable ---')
     dirs.length >= 2 && new Set(dirs).size === dirs.length &&
     dirs.every((dir) => !dir.includes('\u2026') && dir.startsWith('lib/client/features/')),
     JSON.stringify(dirs))
+}
+
+console.log('\n--- the add-workspace chooser follows its own setting ---')
+{
+  // The switch decides whether DSH's "添加工作区" opens this plugin's three-way
+  // dialog or DSH's own native directory flow. That is not a render-time branch:
+  // the dialog is a slot REGISTRATION, so switching off has to hand the seat
+  // back. A build that only stopped rendering would leave the button doing
+  // nothing at all, which is why the registrations themselves are asserted.
+  const flowNames = ['conversation.hero.workspace.directoryFlow', 'sidebar.workspaces.directoryFlow']
+  const context = createClientContext({ connection: createRpcStub(healthyHandlers()) })
+  context.ctx.workspaces = { create: async () => ({ workspaceId: 'ws' }), list: { getSnapshot: () => ({ items: [] }), subscribe: () => () => {} } }
+  context.ctx.uiWorkspace = { pickDirectory: async () => null, listDirectory: async () => null, createDirectory: async () => {}, openWorkspace: async () => {} }
+  // ONE module instance for both the seats and the publishes: a second
+  // `loadClientModule` would get its own copy of the config store, and the
+  // setting would then be written where nobody is listening.
+  const flowPlugin = loadClientModule(source.replace('    return module.exports',
+    '    module.exports.publishPluginConfig = publishPluginConfig;\n    return module.exports'))
+  flowPlugin.apply(context.ctx)
+  const seats = () => context.registrations.filter((entry) => flowNames.includes(entry.declaration.name))
+  const flowProps = { open: true, busy: false, t, onPicked() {}, onCancel() {}, onError() {} }
+  check('the chooser is installed before the Host has answered',
+    seats().length === 2, JSON.stringify(seats().map((entry) => entry.declaration.name)))
+  check('the chooser shadows DSH with the lower rank',
+    seats().every((entry) => entry.declaration.priority === -10),
+    JSON.stringify(seats().map((entry) => entry.declaration.priority)))
+  let seatTree = mount(seats()[0].Component, flowProps).tree
+  seatTree = await flush(seats()[0].Component, flowProps)
+  check('the installed chooser renders the three-way dialog', hasText(seatTree, t('clone.add')), textOf(seatTree).slice(0, 200))
+  // Turning the switch off travels through the same published config the settings
+  // page writes, so the page and the seat cannot disagree after a save.
+  flowPlugin.publishPluginConfig({ ...CONFIG, workspaceAddDialog: false })
+  check('switching the setting off hands both seats back',
+    seats().length === 0, JSON.stringify(seats().map((entry) => entry.declaration.name)))
+  flowPlugin.publishPluginConfig({ ...CONFIG, workspaceAddDialog: true })
+  check('switching it on reclaims both seats', seats().length === 2)
+  seatTree = await flush(seats()[0].Component, flowProps)
+  check('a reclaimed seat answers again', hasText(seatTree, t('clone.add')))
+  // An older Host drops an unknown key. The seat must stay where the plugin put
+  // it: a missing key is the default (on), not an instruction to withdraw.
+  flowPlugin.publishPluginConfig({ gitPath: '', defaultRepo: '' })
+  check('a Host without the key keeps the default chooser', seats().length === 2, String(seats().length))
+  context.effects.find((effect) => effect?.label === 'git: workspace add dialog setting').result()
+  check('unloading the plugin releases the seats it took', seats().length === 0,
+    JSON.stringify(seats().map((entry) => entry.declaration.name)))
+  runCleanups()
+}
+
+console.log('\n--- a seat declared late still registers under its own name ---')
+{
+  // DSH's own directory-flow declaration is owned by another package, so the
+  // `slots.inject` body can run AFTER activation. A function-scoped loop variable
+  // would then register both seats under the last slot's name, and the hero would
+  // quietly keep DSH's native chooser.
+  const context = createClientContext({ connection: createRpcStub(healthyHandlers()), deferInjections: true })
+  context.ctx.workspaces = { create: async () => ({ workspaceId: 'ws' }), list: { getSnapshot: () => ({ items: [] }), subscribe: () => () => {} } }
+  context.ctx.uiWorkspace = { pickDirectory: async () => null, listDirectory: async () => null, createDirectory: async () => {}, openWorkspace: async () => {} }
+  loadClientModule(source).apply(context.ctx)
+  const flowNames = ['conversation.hero.workspace.directoryFlow', 'sidebar.workspaces.directoryFlow']
+  const before = context.registrations.filter((entry) => flowNames.includes(entry.declaration.name))
+  check('nothing is registered while the seats are undeclared', before.length === 0, String(before.length))
+  context.runDeferredInjections()
+  const late = context.registrations.filter((entry) => flowNames.includes(entry.declaration.name))
+  check('a late declaration registers each seat under its own name',
+    late.length === 2 && new Set(late.map((entry) => entry.declaration.name)).size === 2,
+    JSON.stringify(late.map((entry) => entry.declaration.name)))
+  runCleanups()
+}
+
+console.log('\n--- the add-workspace setting is a switch on the General page ---')
+{
+  const context = createClientContext({ connection: createRpcStub(healthyHandlers({
+    config: () => ({ ...CONFIG, workspaceAddDialog: true }),
+    setConfig: (payload) => ({ ...CONFIG, workspaceAddDialog: true, ...payload.patch }),
+  })) })
+  context.ctx.workspaces = { create: async () => ({ workspaceId: 'ws' }), list: { getSnapshot: () => ({ items: [] }), subscribe: () => () => {} } }
+  context.ctx.uiWorkspace = { pickDirectory: async () => null, listDirectory: async () => null, createDirectory: async () => {}, openWorkspace: async () => {} }
+  loadClientModule(source).apply(context.ctx)
+  const section = context.registrations.find((entry) => entry.declaration.name === 'settings.section')
+  mount(section.Component, { t })
+  let tree2 = await flush(section.Component, { t })
+  const rows = walk(tree2).filter((node) => node.props?.className === 'dshgit-checkrow')
+  const row = rows.find((node) => textOf(node).includes(t('settings.workspaceAddDialog')))
+  const box = row === undefined ? undefined : findAll(row, 'input')[0]
+  check('the General page offers the add-workspace switch, on by default',
+    box !== undefined && box.props.checked === true && box.props.disabled !== true,
+    `${rows.length} checkbox rows`)
+  check('the switch explains what it changes', hasText(tree2, t('settings.workspaceAddDialogHint')))
+  box.props.onChange({ currentTarget: { checked: false } })
+  tree2 = await flush(section.Component, { t })
+  check('turning it off saves that one key', context.connection.calls.some((call) =>
+    call.method === 'setConfig' && call.payload.patch.workspaceAddDialog === false),
+    JSON.stringify(context.connection.calls.map((call) => call.method)))
+  runCleanups()
 }
 
 console.log('\n--- the workspace flow picks the right chooser for the platform ---')
