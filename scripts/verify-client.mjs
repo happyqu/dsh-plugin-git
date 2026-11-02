@@ -11,7 +11,7 @@
  */
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { findHeroWorkspaceRow, insertHeroActions, syncHeroBranchFont } from '../lib/client/core/hero-placement.js'
 import { historyRangeWindow } from '../lib/client/core/history-range.js'
 import { popoverPosition } from '../lib/client/ui/popover-position.js'
@@ -570,9 +570,29 @@ console.log('\n--- the dropdown is a themed combobox list, not a UA-painted popu
   // up as a white box in a dark dialog) and it could not be typed into. The list
   // is now our own DOM, portalled to `body`, so both problems disappear — and the
   // styling assertions move onto that list.
-  check('no native select is styled or rendered any more',
-    !css.includes('.dshgit-select'),
-    (css.match(/\.dshgit-select[^{]*\{[^}]*\}/g) ?? []).slice(0, 2).join(' '))
+  // A CSS-class check is not enough: a native <select> needs no class at all,
+  // and one hid in the hunk strip precisely because only the stylesheet was
+  // scanned. Search the SOURCES for the element instead.
+  const nativeSelect = (() => {
+    const dir = new URL('../lib/client/', import.meta.url)
+    const found = []
+    const visit = (folder) => {
+      for (const entry of readdirSync(folder, { withFileTypes: true })) {
+        const path = new URL(`${entry.name}${entry.isDirectory() ? '/' : ''}`, folder)
+        if (entry.isDirectory()) visit(path)
+        else if (entry.name.endsWith('.js') && !path.pathname.endsWith('locales.js')) {
+          const text = readFileSync(path, 'utf8')
+          // `h('select'` is how this codebase creates elements; a bare string
+          // mention in a comment is not a match.
+          if (/h\(\s*'select'/.test(text)) found.push(entry.name)
+        }
+      }
+    }
+    visit(dir)
+    return found
+  })()
+  check('no native select is rendered any more', nativeSelect.length === 0, nativeSelect.join(','))
+  check('no native select is styled any more', !css.includes('.dshgit-select'))
 
   // The list must be positioned by us rather than nested: the workbench header
   // lives in a shell with `overflow:hidden` and a `backdrop-filter`, both of which
@@ -5363,18 +5383,28 @@ console.log('\n--- the pick queue and the hunk strip reach the Host ---')
   // Acting on "whatever is first" is how the wrong lines get staged, so nothing may fire
   // before a hunk is chosen.
   check('the actions stay disabled until a hunk is chosen', stageButton().props.disabled === true)
-  const picker = () => findAll(stripTree, 'select').find((node) => node.props['data-hunk-target'] !== undefined)
-  check('the strip offers a picker listing every hunk plus a placeholder',
-    picker() !== undefined && findAll(stripTree, 'option').length === 3)
+  // The picker is the themed ComboBox: open it, then click the option. That is
+  // the same contract the other combobox tests drive, and it needs no native
+  // `change` event.
+  const picker = () => findAll(stripTree, 'input').find((node) => node.props.name === 'hunkTarget')
+  check('the strip offers a picker for the hunk to act on',
+    picker() !== undefined && picker().props.role === 'combobox')
   check('no action fires merely from choosing a hunk', acts.length === 0)
 
   // Choosing a hunk unlocks the actions, and the reported index is the CHOSEN one — the
   // failure this prevents is "stage hunk 2" silently staging hunk 1.
-  const secondTree = await flush(() => h(HunkActions, Object.assign(stripProps((action, index) => acts.push({ action, index })), {})), {})
-  const secondPicker = () => findAll(secondTree, 'select').find((node) => node.props['data-hunk-target'] !== undefined)
-  secondPicker().props.onChange({ currentTarget: { value: '1' } })
-  stripTree = await flush(() => h(HunkActions, stripProps((action, index) => acts.push({ action, index }))), {})
-  void secondPicker
+  const repaint = async () => {
+    stripTree = await flush(() => h(HunkActions, stripProps((action, index) => acts.push({ action, index }))), {})
+  }
+  const pickHunk = async (indexValue) => {
+    picker().props.onClick()
+    await repaint()
+    const option = findAll(stripTree, 'button')
+      .find((node) => node.props.role === 'option' && node.props['data-value'] === indexValue)
+    option.props.onClick()
+    await repaint()
+  }
+  await pickHunk('1')
   const stageNow = () => findAll(walk(stripTree).find((node) => node.props?.['data-hunk-bar'] === 'true') ?? {}, 'button')
     .find((node) => node.props['data-hunk-action'] === 'stage')
   stageNow().props.onClick()
@@ -5384,6 +5414,53 @@ console.log('\n--- the pick queue and the hunk strip reach the Host ---')
 
   currentHarness = makeHarness(client, stub).Harness
   tree = await renderApp()
+}
+
+console.log('\n--- line-level staging ---')
+{
+  // Line staging is the finer granularity of the hunk strip: it writes the same
+  // fingerprints, so the Host validates it exactly as strictly. These checks
+  // drive the patcher directly, because what matters is the PATCH it builds.
+  const { splitHunks, linesPatch } = await import('../lib/git/hunks.js')
+  const diff = splitHunks([
+    'diff --git a/a.txt b/a.txt',
+    'index 111..222 100644',
+    '--- a/a.txt',
+    '+++ b/a.txt',
+    '@@ -1,3 +1,3 @@',
+    ' one',
+    '-two',
+    '+TWO',
+    ' three',
+    '',
+  ].join('\n'))
+  const hunk = diff.hunks[0]
+  const removedIndex = hunk.lines.findIndex((line) => line.startsWith('-'))
+  const addedIndex = hunk.lines.findIndex((line) => line.startsWith('+'))
+
+  const wholeHunk = linesPatch(diff, { [hunk.hash]: [removedIndex, addedIndex] })
+  check('selecting every change line reproduces the edit',
+    wholeHunk.includes('-two') && wholeHunk.includes('+TWO'), wholeHunk)
+
+  // Choosing ONLY the addition must keep the removal as context, or every later
+  // line of the file shifts when the patch is applied.
+  const onlyAdd = linesPatch(diff, { [hunk.hash]: [addedIndex] })
+  check('an unselected removal survives as context',
+    onlyAdd.includes(' two') && onlyAdd.includes('+TWO') && !onlyAdd.includes('-two'),
+    onlyAdd)
+  check('the rewritten header counts the surviving context',
+    /@@ -1,3 \+1,4 @@/.test(onlyAdd), onlyAdd.split('\n').find((line) => line.startsWith('@@')))
+
+  const onlyRemove = linesPatch(diff, { [hunk.hash]: [removedIndex] })
+  check('an unselected addition is not emitted at all',
+    onlyRemove.includes('-two') && !onlyRemove.includes('TWO'), onlyRemove)
+
+  check('no selected lines builds no patch', linesPatch(diff, { [hunk.hash]: [] }) === '')
+  // An unknown fingerprint is not a licence to build a partial patch: the Host
+  // rejects the request before this is ever reached, and the builder must not
+  // quietly produce something for a hunk it was not given.
+  check('a fingerprint with no matching hunk produces nothing',
+    linesPatch(diff, { 'not-a-real-hash': [addedIndex] }) === '')
 }
 console.log('PASS the pick queue and the hunk strip reach the Host with the right payloads')
 
@@ -5401,10 +5478,18 @@ for (const staged of [false, true]) {
   const row = walk(view).find(node => node.props?.title === file.path && String(node.props?.className ?? '').includes('dshgit-change'))
   row.props.onClick({ preventDefault() {}, stopPropagation() {}, currentTarget: { closest: () => null } })
   view = await flush(GitApp, rootProps)
-  const picker = () => findAll(view, 'select').find(node => node.props['data-hunk-target'] !== undefined)
+  const picker = () => findAll(view, 'input').find(node => node.props.name === 'hunkTarget')
   check(`${staged ? 'staged' : 'unstaged'} file mounts the hunk picker in the full app`, picker() !== undefined)
-  picker().props.onChange({ currentTarget: { value: '0' } })
-  view = await flush(GitApp, rootProps)
+  // Choose the first hunk through the combobox's own open-then-option flow.
+  const chooseFirstHunk = async () => {
+    picker().props.onClick()
+    view = await flush(GitApp, rootProps)
+    const option = findAll(view, 'button')
+      .find(node => node.props.role === 'option' && node.props['data-value'] === '0')
+    option.props.onClick()
+    view = await flush(GitApp, rootProps)
+  }
+  await chooseFirstHunk()
   const action = staged ? 'unstage' : 'stage'
   findAll(view, 'button').find(node => node.props['data-hunk-action'] === action).props.onClick()
   view = await flush(GitApp, rootProps)
@@ -5412,8 +5497,7 @@ for (const staged of [false, true]) {
   check(`${action} sends the selected fingerprint from the full app`,
     mounted.rpc.calls.some(call => call.method === method && call.payload.hashes[0] === 'current-hunk' && call.payload.staged === staged))
   if (!staged) {
-    picker().props.onChange({ currentTarget: { value: '0' } })
-    view = await flush(GitApp, rootProps)
+    await chooseFirstHunk()
     findAll(view, 'button').find(node => node.props['data-hunk-action'] === 'discard').props.onClick()
     view = await flush(GitApp, rootProps)
     const dialog = walk(view).find(node => node.props?.role === 'alertdialog')
