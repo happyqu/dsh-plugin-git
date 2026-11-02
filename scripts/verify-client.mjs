@@ -5536,6 +5536,35 @@ for (const staged of [false, true]) {
     const contextRows = findAll(view, 'div').filter(node => node.props['data-kind'] === 'ctx')
     check('context lines offer no pick gutter',
       contextRows.every(node => !findAll(node, 'button').some(child => child.props['data-diff-pick'] !== undefined)))
+
+    // The interaction itself: clicking a gutter must raise the line bar, and
+    // the bar's stage action must send a `lines` payload keyed by the hunk
+    // fingerprint the Host re-validates. Without this the feature could render
+    // gaps that do nothing, which is the exact failure bug 2 produced.
+    const firstPick = () => findAll(view, 'button').find(node => node.props['data-diff-pick'] !== undefined)
+    check('no line bar is shown before anything is picked', firstPick().props['aria-pressed'] === false &&
+      !walk(view).some(node => node.props?.['data-line-bar'] === 'true'))
+    firstPick().props.onClick({ stopPropagation() {} })
+    view = await flush(GitApp, rootProps)
+    const bar = () => walk(view).find(node => node.props?.['data-line-bar'] === 'true')
+    check('picking a line raises the line action bar', bar() !== undefined)
+    check('the bar reports the picked count', bar() !== undefined && hasText(bar(), t('line.selected', { count: 1 })))
+    // The picked row is marked so the user can see what will move. The value is
+    // a boolean in the rendered props (React turns `true` into the "true"
+    // attribute), so this checks the strict value the component actually emits.
+    const picked = findAll(view, 'div').filter(node => node.props['data-picked'] === true)
+    check('the picked row is marked', picked.length === 1, `${picked.length}`)
+
+    findAll(bar(), 'button').find(node => node.props['data-line-action'] === 'stage').props.onClick()
+    view = await flush(GitApp, rootProps)
+    const lineCall = mounted.rpc.calls.filter(call => call.method === 'write.stageHunks').pop()
+    check('line staging sends a lines payload keyed by the hunk fingerprint',
+      lineCall !== undefined && lineCall.payload.lines !== undefined &&
+        Object.keys(lineCall.payload.lines).length === 1 && lineCall.payload.hashes === undefined,
+      JSON.stringify(lineCall?.payload))
+    check('the line payload points at a real change line',
+      lineCall !== undefined && Object.values(lineCall.payload.lines)[0].length === 1,
+      JSON.stringify(lineCall?.payload?.lines))
   }
   // Choose the first hunk through the combobox's own open-then-option flow.
   const chooseFirstHunk = async () => {
@@ -5551,8 +5580,10 @@ for (const staged of [false, true]) {
   findAll(view, 'button').find(node => node.props['data-hunk-action'] === action).props.onClick()
   view = await flush(GitApp, rootProps)
   const method = staged ? 'write.unstageHunks' : 'write.stageHunks'
+  // `hashes` is optional: the line-staging assertion above also calls this
+  // method with a `lines` payload, so the lookup must not assume it exists.
   check(`${action} sends the selected fingerprint from the full app`,
-    mounted.rpc.calls.some(call => call.method === method && call.payload.hashes[0] === 'current-hunk' && call.payload.staged === staged))
+    mounted.rpc.calls.some(call => call.method === method && call.payload.hashes?.[0] === 'current-hunk' && call.payload.staged === staged))
   if (!staged) {
     await chooseFirstHunk()
     findAll(view, 'button').find(node => node.props['data-hunk-action'] === 'discard').props.onClick()
