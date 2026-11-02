@@ -420,6 +420,89 @@ check('the commit options are offered from the split button menu',
   String(loaded.appendedStyles[0]?.textContent).includes('.dshgit-commit-options{'))
 
 /* ------------------------------------------------------------------ *
+ * Header chips fit the band they are given
+ * ------------------------------------------------------------------ */
+
+// The chips are a `flex:none` child of the Host's `flex:none` utilities
+// cluster, so when the session column got narrow they overflowed and painted
+// on top of the Host's own subagent/jobs chips ("master" over "5 个子智能体").
+// Two things keep that from returning: the chip row must be allowed to
+// shrink, and the density tiers must be keyed on the BAND — the Host's
+// title row is an inline-size container — not on the viewport, because a
+// wide window with a right dock open leaves a narrow column.
+{
+  const css = String(loaded.appendedStyles[0]?.textContent ?? '')
+  console.log('\n--- the header chips fit the band they are given ---')
+  check('a header chip may shrink instead of overflowing',
+    /\.dshgit-chipcluster>\.dshgit-chip\[data-chip\]\{[^}]*flex:0 1 auto[^}]*min-width:0/.test(css),
+    /\.dshgit-chipcluster>\.dshgit-chip\[data-chip\]\{[^}]*\}/.exec(css)?.[0] ?? 'rule missing')
+  // The icon chevron is a fixed cell: it must not collapse to a sliver.
+  check('the sync chevron keeps its fixed width',
+    /\.dshgit-chipcluster>\.dshgit-chip\[data-chip="sync-menu"\]\{[^}]*flex:0 0 22px/.test(css),
+    /\.dshgit-chipcluster>\.dshgit-chip\[data-chip="sync-menu"\]\{[^}]*\}/.exec(css)?.[0] ?? 'rule missing')
+  // The cluster itself reports its width to the Host's flex line.
+  check('the chip cluster declares a shrinkable minimum',
+    /\.dshgit-chipcluster\{[^}]*min-width:0[^}]*max-width:100%/.test(css),
+    /\.dshgit-chipcluster\{[^}]*\}/.exec(css)?.[0] ?? 'rule missing')
+  // Read every `@container(max-width:Npx){...}` with a balanced-brace scan:
+  // a regex would stop at the first `}}` and hand back a truncated rule.
+  const tiers = []
+  for (const match of css.matchAll(/@container\(max-width:(\d+)px\)\{/g)) {
+    const open = match.index + match[0].length
+    let depth = 1
+    let cursor = open
+    while (cursor < css.length && depth > 0) {
+      if (css[cursor] === '{') depth += 1
+      else if (css[cursor] === '}') depth -= 1
+      cursor += 1
+    }
+    const body = css.slice(open, cursor - 1)
+    if (body.includes('dshgit-chip')) tiers.push({ width: Number(match[1]), body })
+  }
+  tiers.sort((a, b) => b.width - a.width)
+  check('the chip density tiers are container queries, widest first',
+    tiers.length >= 3 && tiers.every((tier, index) => index === 0 || tiers[index - 1].width > tier.width),
+    tiers.map((tier) => tier.width).join(','))
+  // Each tier must give room back, never demand it: hiding or clamping only.
+  // `max-width` is the clamping form; a bare `width`/`min-width` would be a
+  // tier asking for MORE space, which is the bug this whole block is about.
+  check('no tier widens a chip to buy space',
+    tiers.every((tier) => !/(?:^|[^-])min-width:\s*\d/.test(tier.body) &&
+      !/(?:^|[^-])width:\s*\d/.test(tier.body.replace(/max-width:/g, 'max:'))),
+    tiers.map((tier) => tier.body.match(/(?:max-)?width:[^;}]+/g)).filter(Boolean).join(' '))
+  // The widest tier drops the counts chip and the chevron: those are the two
+  // whose actions the branch popover also carries.
+  const widest = tiers[0]
+  check('the first narrow tier drops the counts and the sync chevron',
+    widest !== undefined && widest.body.includes('[data-chip="changes"]') && widest.body.includes('[data-chip="sync-menu"]'),
+    widest?.body.slice(0, 200) ?? 'no tier')
+  // The narrowest tier yields the whole cluster rather than painting over the
+  // Host's session title, and the launcher stays as the entry point.
+  check('the narrowest tier yields the chips instead of overlapping',
+    tiers.some((tier) => /\.dshgit-chipcluster\{display:none\}/.test(tier.body)),
+    tiers.map((tier) => `${tier.width}:${/\.dshgit-chipcluster\{display:none\}/.test(tier.body)}`).join(','))
+  // The launcher beside the cluster draws the SAME Git glyph. A label-less
+  // branch chip next to it reads as a second, identical button that does
+  // something else, so the chip goes and the launcher's popover keeps the
+  // branch reachable.
+  check('a label-less branch chip is replaced by the launcher, not left beside it', (() => {
+    const labelTier = tiers.find((tier) => /\.dshgit-chip\[data-chip="branch"\] \.dshgit-chipname\{display:none\}/.test(tier.body))
+    const chipTier = tiers.find((tier) => /\.dshgit-chip\[data-chip="branch"\]\{display:none\}/.test(tier.body))
+    // Hiding the label alone is only safe while the chip still says something;
+    // with the launcher present, the whole chip must go at the same width.
+    return chipTier !== undefined && (labelTier === undefined || labelTier.width >= chipTier.width)
+  })(), tiers.map((tier) => `${tier.width}:${/\[data-chip="branch"\]\{display:none\}/.test(tier.body) ? 'chip' : '-'}`).join(','))
+  // Compact (Hero) placement has its own, static density: the tiers must not
+  // apply there, or the Hero row would lose chips it has room for.
+  check('the density tiers leave the compact Hero cluster alone',
+    tiers.every((tier) => tier.body.includes(':not([data-compact])')),
+    tiers.map((tier) => tier.body.includes(':not([data-compact])')).join(','))
+  // A Host that is not a size container keeps the old full-density behaviour.
+  check('container queries are feature-detected, with a viewport fallback',
+    css.includes('@supports(container-type:inline-size){') && /@media\(max-width:620px\)\{\.dshgit-chip\[data-chip="branch"\]/.test(css))
+}
+
+/* ------------------------------------------------------------------ *
  * Type scale
  * ------------------------------------------------------------------ */
 
