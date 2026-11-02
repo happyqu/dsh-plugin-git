@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { readFileSync } from 'node:fs'
 import { findHeroWorkspaceRow, insertHeroActions, syncHeroBranchFont } from '../lib/client/core/hero-placement.js'
+import { historyRangeWindow } from '../lib/client/core/history-range.js'
 import { popoverPosition } from '../lib/client/ui/popover-position.js'
 import { observeWorkspaceNavigation, getWorkspaceNavigation, acknowledgeWorkspaceNavigation } from '../lib/client/core/workspace-navigation.js'
 import { withHunkFingerprint } from '../lib/git/hunkFingerprint.js'
@@ -2692,9 +2693,15 @@ console.log('\n--- full workbench commit button has a separate options arrow ---
   arrow.props.onClick({ stopPropagation() {} })
   tree = await flush(GitApp, { connection: mounted.rpc, t })
   check('the workbench menu offers commit and remote follow-ups without amend',
+    // The three ACTIONS come first, in this order; the sticky flags follow a
+    // separator. `amend` stays out on purpose: it rewrites the previous commit,
+    // so it belongs to the history surface where its effect is visible.
     findAll(tree, 'button').filter((node) => node.props.role === 'menuitem')
       .map(textOf).join(',') ===
-      [t('action.commit'), t('action.commitAndPush'), t('action.commitAndSync')].join(','))
+      [t('action.commit'), t('action.commitAndPush'), t('action.commitAndSync'),
+        t('commit.signoff'), t('commit.noVerify')].join(',') &&
+    !findAll(tree, 'button').filter((node) => node.props.role === 'menuitem')
+      .some((node) => /amend/i.test(textOf(node))))
 }
 
 console.log('\n--- undo commit asks, then runs with confirmation ---')
@@ -5544,6 +5551,131 @@ console.log('\n--- skip is reachable and confirmed from both operation surfaces 
       findAll(view, 'button').some(node => node.props['data-op-action'] === action)))
     runCleanups()
   }
+}
+
+console.log('\n--- commit flags, remote removal and history filters are reachable ---')
+{
+  // Three capabilities the Host implemented but the panel never exposed. What
+  // is asserted here is reachability and payload shape; the git behaviour
+  // itself lives in check-runtime.mjs.
+  const handlers = healthyHandlers()
+  tree = await renderApp(handlers)
+  const openCommitMenu = async (current) => {
+    findAll(current, 'button').find((node) => String(node.props.className).includes('dshgit-commit-arrow')).props.onClick({ stopPropagation() {} })
+    return flush(GitApp, { connection: mounted.rpc, t })
+  }
+  tree = await openCommitMenu(tree)
+  const menuItem = (current, id) => findAll(current, 'button').find((node) => node.props.role === 'menuitem' && hasText(node, id))
+  const signoffItem = () => menuItem(tree, t('commit.signoff'))
+  check('the commit menu offers a Signed-off-by switch', signoffItem() !== undefined)
+  check('the signoff switch starts off', signoffItem().props['aria-checked'] === false)
+  signoffItem().props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('ticking signoff keeps the menu open for the next switch', signoffItem().props['aria-checked'] === true)
+  // The payload carries what is armed and nothing else: an untouched option
+  // must not appear, or the output log stops matching what actually ran.
+  findAll(tree, 'textarea').find((node) => node.props.placeholder === t('commit.placeholderMessage'))
+    .props.onChange({ currentTarget: { value: 'feat: flag the commit' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'button').find((node) => textOf(node) === t('action.commit')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const flagged = mounted.rpc.calls.filter((call) => call.method === 'write.commit').pop()
+  check('the commit carries signoff once it is armed', flagged?.payload?.signoff === true, JSON.stringify(flagged?.payload))
+  check('an unarmed option is omitted from the payload', flagged?.payload?.noVerify === undefined)
+  // An armed `--no-verify` must stay RED. Both classes are single-class rules,
+  // so without an explicit combined rule the checked tint would win and paint
+  // the one state whose whole point is its warning colour in calm blue.
+  tree = await openCommitMenu(tree)
+  menuItem(tree, t('commit.noVerify')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const css = String(loaded.appendedStyles[0]?.textContent ?? '')
+  check('an armed no-verify keeps its danger tint over the checked tint',
+    css.includes('.dshgit-menuitemchecked.dshgit-menudanger{') &&
+      menuItem(tree, t('commit.noVerify')).props.className.includes('dshgit-menudanger'),
+    menuItem(tree, t('commit.noVerify')).props.className)
+
+  // Remote removal: the settings block lists remotes and asks before writing.
+  tree = await renderApp(healthyHandlers())
+  tree = await selectModule(tree, 'settings')
+  findAll(tree, 'button').find((node) => textOf(node) === t('settings.currentRepo')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const removeButton = () => findAll(tree, 'button').find((node) => node.props['data-remote-remove'] === 'origin')
+  check('the repository settings list the configured remotes',
+    walk(tree).some((node) => node.props?.['data-remote'] === 'origin'))
+  check('removing a remote is offered', removeButton() !== undefined)
+  // The first click arms, the second writes: a remote can be re-added, but only
+  // with its URL in hand, so the confirmation is what makes the loss explicit.
+  check('removing a remote asks before writing',
+    mounted.rpc.calls.every((call) => call.method !== 'write.removeRemote'))
+  removeButton().props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('the armed remote shows a confirm action',
+    findAll(tree, 'button').some((node) => node.props['data-remote-confirm'] === 'origin'))
+  findAll(tree, 'button').find((node) => node.props['data-remote-confirm'] === 'origin').props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const removal = mounted.rpc.calls.filter((call) => call.method === 'write.removeRemote').pop()
+  check('confirming removes only the named remote', removal?.payload?.name === 'origin' &&
+    removal.payload.confirm === true, JSON.stringify(removal?.payload))
+  // A failure that is never rendered is invisible: the table just keeps the
+  // remote and the user reads it as "the button did nothing".
+  check('a successful removal is reported back to the user',
+    walk(tree).some((node) => node.props?.role === 'status' && hasText(node, t('remote.removed', { name: 'origin' }))))
+
+  // History filters: the disclosure sends the Host's own log options.
+  tree = await renderApp(healthyHandlers())
+  findAll(tree, 'button').find((node) => node.props['data-module'] === 'history').props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const toggle = () => findAll(tree, 'button').find((node) => node.props['data-history-filters-toggle'] === true)
+  check('the history sidebar offers a filter trigger', toggle() !== undefined)
+  check('the filter panel starts closed', toggle().props['aria-expanded'] === false &&
+    !walk(tree).some((node) => node.props?.['data-history-filters-panel'] === 'true'))
+  toggle().props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  // A POPOVER, not an inline block: opening the filter must not displace the
+  // commit list or the search box, so the panel renders through a portal and
+  // the sidebar keeps exactly the same rows it had while closed.
+  check('the filter panel opens as a portalled popover',
+    walk(tree).some((node) => node.props?.['data-history-filters-panel'] === 'true') &&
+      toggle().props['aria-expanded'] === true)
+  const authorInput = () => findAll(tree, 'input').find((node) => node.props.placeholder === t('history.authorPlaceholder'))
+  check('the filter panel exposes an author field', authorInput() !== undefined)
+  authorInput().props.onChange({ currentTarget: { value: '张三' } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const query = mounted.rpc.calls.filter((call) => call.method === 'commits').pop()
+  check('the author filter reaches the Host as --author', query?.payload?.author === '张三', JSON.stringify(query?.payload))
+  // The time range is a PRESET, not a free-text date field: the panel offers
+  // ranges the user can pick, and translates the choice into `--since` itself.
+  const rangeCombo = () => findAll(tree, 'button').find((node) => node.props['aria-label'] === t('history.range'))
+  check('the time range is chosen from presets, not typed', rangeCombo() !== undefined &&
+    !findAll(tree, 'input').some((node) => node.props.title === t('history.datePlaceholder')))
+  // Assert the CONTRACT rather than driving a DOM click: the ComboBox focuses
+  // its input on open, which a node-based harness cannot satisfy, and what
+  // matters is that the preset ids and labels are offered and that the chosen
+  // id becomes an ISO `--since`.
+  check('the preset list offers the common ranges',
+    ['history.rangeAll', 'history.range7d', 'history.range30d', 'history.range90d', 'history.rangeYear']
+      .every((key) => t(key) !== key))
+  const ranges = historyRangeWindow('7d', new Date('2026-11-02T00:00:00Z'))
+  check('a preset resolves to an ISO lower bound seven days back',
+    ranges !== null && ranges.since === '2026-10-26T00:00:00.000Z', JSON.stringify(ranges))
+  check('the year preset starts at January 1 of the reference year',
+    historyRangeWindow('year', new Date('2026-11-02T00:00:00Z'))?.since ===
+      new Date(2026, 0, 1).toISOString())
+  // "All time" must send no bound at all rather than an epoch.
+  check('all time resolves to no bound', historyRangeWindow('', new Date()) === null)
+  // The merge policy is a ComboBox (a native select would be UA-painted).
+  const mergeCombo = findAll(tree, 'button').find((node) => node.props['aria-label'] === t('history.merges'))
+  check('the merge policy uses the themed combobox', mergeCombo !== undefined && !findAll(tree, 'select').length)
+  // The active-filter dot is the only evidence, once closed, that the list is
+  // a subset rather than the whole history.
+  toggle().props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('a filtered list shows the active marker while closed',
+    toggle().props['aria-expanded'] === false &&
+      findAll(toggle(), 'span').some((node) => node.props.className === 'dshgit-filterbadge'))
+  check('closing the popover keeps the filter applied',
+    mounted.rpc.calls.filter((call) => call.method === 'commits').pop()?.payload?.author === '张三')
+  runCleanups()
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
