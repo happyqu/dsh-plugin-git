@@ -5421,7 +5421,8 @@ console.log('\n--- line-level staging ---')
   // Line staging is the finer granularity of the hunk strip: it writes the same
   // fingerprints, so the Host validates it exactly as strictly. These checks
   // drive the patcher directly, because what matters is the PATCH it builds.
-  const { splitHunks, linesPatch } = await import('../lib/git/hunks.js')
+  const { splitHunks, linesPatch, hunksPatch } = await import('../lib/git/hunks.js')
+  const { parseUnifiedDiff } = await import('../lib/git/parse.js')
   const diff = splitHunks([
     'diff --git a/a.txt b/a.txt',
     'index 111..222 100644',
@@ -5461,6 +5462,47 @@ console.log('\n--- line-level staging ---')
   // quietly produce something for a hunk it was not given.
   check('a fingerprint with no matching hunk produces nothing',
     linesPatch(diff, { 'not-a-real-hash': [addedIndex] }) === '')
+
+  // ---- `\ No newline at end of file` -------------------------------------
+  //
+  // git emits this marker BETWEEN the two sides when a file lacks a trailing
+  // newline, so it used to sit inside the hunk's line array and shift every
+  // index after it. The renderer drops it (it is not a line of the file), so
+  // the UI and the Host numbered the same hunk differently — and the mismatch
+  // silently staged the WRONG line: selecting the last addition staged the one
+  // before it. These checks pin both halves of the fix.
+  const markerDiff = splitHunks([
+    'diff --git a/a.txt b/a.txt',
+    'index 111..222 100644',
+    '--- a/a.txt',
+    '+++ b/a.txt',
+    '@@ -1,2 +1,3 @@',
+    ' a',
+    '-b',
+    '\\ No newline at end of file',
+    '+B',
+    '+c',
+    '\\ No newline at end of file',
+    '',
+  ].join('\n'))
+  const markerHunk = markerDiff.hunks[0]
+  check('the no-newline marker is not counted as a content line',
+    markerHunk.lines.length === 4 && !markerHunk.lines.some((line) => line.startsWith('\\')),
+    JSON.stringify(markerHunk.lines))
+  // The renderer's view of the same hunk must agree on every index.
+  check('the marker does not shift the indices the renderer shows',
+    JSON.stringify(parseUnifiedDiff(markerDiff.header + '\n' + markerHunk.header + '\n' + markerHunk.lines.join('\n'))[0].lines)
+      === JSON.stringify(markerHunk.lines), JSON.stringify(markerHunk.lines))
+  // Whole-hunk staging must still be byte-faithful: the markers are re-inserted.
+  check('whole-hunk staging keeps the markers so the patch stays byte-identical',
+    hunksPatch(markerDiff, [markerHunk.hash]) === markerDiff.header + '\n' + markerHunk.header + '\n' +
+      ' a\n-b\n\\ No newline at end of file\n+B\n+c\n\\ No newline at end of file\n',
+    JSON.stringify(hunksPatch(markerDiff, [markerHunk.hash])))
+  // And line picking is refused rather than silently wrong.
+  let refusedNoNewline = false
+  try { linesPatch(markerDiff, { [markerHunk.hash]: [3] }) }
+  catch (error) { refusedNoNewline = /换行符/.test(error.message) }
+  check('line picking is refused when the file ends without a newline', refusedNoNewline)
 }
 console.log('PASS the pick queue and the hunk strip reach the Host with the right payloads')
 
@@ -5480,6 +5522,21 @@ for (const staged of [false, true]) {
   view = await flush(GitApp, rootProps)
   const picker = () => findAll(view, 'input').find(node => node.props.name === 'hunkTarget')
   check(`${staged ? 'staged' : 'unstaged'} file mounts the hunk picker in the full app`, picker() !== undefined)
+  // The picker reaches the DIFF ROWS, not just the strip. This is the check
+  // that catches `setState(fn)`-swallows-a-function and any other break in the
+  // strip-to-renderer handoff: without it the feature silently renders no
+  // pick gutters at all and every assertion above still passes.
+  if (!staged) {
+    const changeRows = findAll(view, 'div').filter(node => node.props['data-kind'] === 'add' || node.props['data-kind'] === 'del')
+    const withGutter = changeRows.filter(node => findAll(node, 'button').some(child => child.props['data-diff-pick'] !== undefined))
+    check('the diff renders a pick gutter on every change line',
+      changeRows.length > 0 && withGutter.length === changeRows.length,
+      `${withGutter.length}/${changeRows.length}`)
+    // Context lines must NOT be pickable: they have no side to move between.
+    const contextRows = findAll(view, 'div').filter(node => node.props['data-kind'] === 'ctx')
+    check('context lines offer no pick gutter',
+      contextRows.every(node => !findAll(node, 'button').some(child => child.props['data-diff-pick'] !== undefined)))
+  }
   // Choose the first hunk through the combobox's own open-then-option flow.
   const chooseFirstHunk = async () => {
     picker().props.onClick()
