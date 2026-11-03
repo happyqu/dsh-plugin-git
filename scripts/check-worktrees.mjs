@@ -3,7 +3,7 @@ import { mkdtemp, writeFile, readFile, mkdir, rename, rm, rmdir, access, symlink
 import { tmpdir } from 'node:os'
 import { join, relative, isAbsolute } from 'node:path'
 import { git, resolveGitPath } from '../lib/git/exec.js'
-import { RepoRegistry } from '../lib/git/repo.js'
+import { RepoRegistry, STATUS_DECORATION_LIMIT } from '../lib/git/repo.js'
 import { changelists } from '../lib/git/changelists.js'
 import { parseWorktrees } from '../lib/git/parse.js'
 import { worktreeDetails, commonDirectory, worktreeManagementPreview, worktreeCreatePreview, worktreeRemovalPreview } from '../lib/git/worktrees.js'
@@ -68,6 +68,26 @@ try {
     assert(observedCommands.some(args => args.includes('diff')))
     assert(observedCommands.some(args => args.includes('check-attr')))
     console.log('PASS summary, basic status and changelists defer numstat/LFS work until full status is requested')
+
+    // Past STATUS_DECORATION_LIMIT changes the numstat decoration is skipped
+    // entirely: it is the one part of a status read that scales with the change
+    // set (seconds, not milliseconds, at a few thousand files), and the panel
+    // derives the same counts from the patch it already loaded. The LFS labels
+    // stay, because check-attr only reads .gitattributes.
+    observedCommands.length = 0
+    const many = join(root, 'many')
+    await mkdir(many)
+    for (let index = 0; index <= STATUS_DECORATION_LIMIT; index++) await writeFile(join(many, `f${index}.txt`), 'x\n')
+    const crowded = await summaryRpc.call('status', { root, force: true })
+    assert.equal(crowded.ok, true)
+    assert.equal(crowded.value.countsDeferred, true)
+    assert(crowded.value.total > STATUS_DECORATION_LIMIT)
+    assert(crowded.value.files.every(file => file.added === null && file.deleted === null))
+    assert(crowded.value.files.every(file => file.binary === null), 'unestablished binary, not "known to be text"')
+    assert(!observedCommands.some(args => args.includes('diff')), 'no numstat for a large change set')
+    assert(observedCommands.some(args => args.includes('check-attr')), 'LFS labels are still read')
+    await rm(many, { recursive: true, force: true })
+    console.log('PASS a large change set skips numstat decoration while keeping LFS labels')
   } finally {
     repo.run = originalRun
     await writeFile(join(root, 'tracked.txt'), 'base\n')
