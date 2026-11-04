@@ -205,7 +205,7 @@ async function fixture(label) {
   const { session } = await registry.open(root)
   const calls = [], originalRun = session.run.bind(session)
   session.run = (args, options) => { calls.push(args); return originalRun(args, options) }
-  const rpc = createRpc({ registry, config: { get: () => ({ ...DEFAULT_CONFIG }) }, logger: { warn() {} } })
+  const rpc = createRpc({ registry, config: { get: () => ({ ...DEFAULT_CONFIG }), load: async () => ({ ...DEFAULT_CONFIG }) }, logger: { warn() {} } })
   const words = await rpc.call('diff', { root, path: 'f.txt', wordDiff: true, algorithm: 'histogram' })
   assert.equal(words.ok, true, words.error?.message)
   assert(calls.some(args => args.includes('--word-diff=plain') && args.includes('--diff-algorithm=histogram')))

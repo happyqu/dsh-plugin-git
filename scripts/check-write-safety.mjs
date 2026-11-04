@@ -28,7 +28,7 @@ for (const [key, value] of Object.entries({ 'user.name': 'Write safety check', '
 for (const name of ['a[1].txt', 'a1.txt', 'outside.txt']) await writeFile(join(root, name), 'before\n')
 await run(['add', '-A']); await run(['commit', '-m', 'initial'])
 const registry = new RepoRegistry({ gitPath }), { session: repo } = await registry.open(root)
-const rpc = createRpc({ registry, config: { get: () => ({ ...DEFAULT_CONFIG }) }, logger: { warn() {} } })
+const rpc = createRpc({ registry, config: { get: () => ({ ...DEFAULT_CONFIG }), load: async () => ({ ...DEFAULT_CONFIG }) }, logger: { warn() {} } })
 for (const name of ['a[1].txt', 'a1.txt', 'outside.txt']) await writeFile(join(root, name), 'after\n')
 await run(['add', '--', 'outside.txt'])
 // A wildcard-expanded commit must not silently include a blocked sibling.

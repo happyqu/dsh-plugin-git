@@ -36,7 +36,7 @@ try {
   const registry = new RepoRegistry({ gitPath }), { session: repo } = await registry.open(root)
   // Header summaries and initial changelists must not fall through to full
   // numstat / LFS decoration, which delays the first usable changes list.
-  const summaryRpc = createRpc({ registry, config: { get: () => DEFAULT_CONFIG } })
+  const summaryRpc = createRpc({ registry, config: { get: () => DEFAULT_CONFIG, load: async () => DEFAULT_CONFIG } })
   const observedCommands = [], originalRun = repo.run.bind(repo)
   repo.run = async (args, options) => { observedCommands.push(args); return originalRun(args, options) }
   try {
@@ -117,7 +117,7 @@ try {
     await pendingEdit
     const concurrentRpc = createRpc({ registry: {
       gitExecutable: async () => gitPath, open: async () => ({ session: concurrentRepo }),
-    }, config: { get: () => DEFAULT_CONFIG } })
+    }, config: { get: () => DEFAULT_CONFIG, load: async () => DEFAULT_CONFIG } })
     const opening = concurrentRpc.call('repos', { path: directory, includeChanges: true })
     try {
       await new Promise(resolve => setImmediate(resolve))
@@ -230,7 +230,7 @@ try {
   assert.equal(parsed[1].prunable, true)
   console.log('PASS NUL porcelain preserves newline paths and metadata')
 
-  const rpc = createRpc({ registry, config: { get: () => ({ ...DEFAULT_CONFIG }) } })
+  const rpc = createRpc({ registry, config: { get: () => ({ ...DEFAULT_CONFIG }), load: async () => ({ ...DEFAULT_CONFIG }) } })
   assert.equal((await rpc.call('worktreeCreatePreview', { root, ...createRequest })).value.valid, true)
   assert.equal((await rpc.call('worktreeRemovalPreview', { root, directory: other })).value.removable, true)
   assert.equal((await rpc.call('repos', { path: root })).value.repos[0].commonDir,

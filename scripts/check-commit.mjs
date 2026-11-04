@@ -103,7 +103,7 @@ assert.deepEqual(await readFile(join(root, '.git', 'index')), index)
 await rm(join(hooks, 'pre-commit'))
 check('hook cannot add files outside the selected scope')
 
-const rpc = createRpc({ registry, config: { get: () => DEFAULT_CONFIG } })
+const rpc = createRpc({ registry, config: { get: () => DEFAULT_CONFIG, load: async () => DEFAULT_CONFIG } })
 async function cancelHookCommit(method, phaseDetail) {
   const started = await rpc.methods.operationStart({ root, method, parameters: { paths: method.endsWith('commitPaths') ? [target] : undefined, message: 'cancel slow hook' } })
   assert.equal(started.ok, true, JSON.stringify(started))

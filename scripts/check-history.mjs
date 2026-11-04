@@ -594,7 +594,7 @@ async function commitsSince(run, base) {
   assert.equal(operation.canSkip, true, 'a replay conflict can still be skipped')
   const conflictReview = await operationReview(repo)
   const conflictRpc = createRpc({ registry: new RepoRegistry({ gitPath }),
-    config: { get: () => ({ ...DEFAULT_CONFIG }) }, logger: { warn() {} } })
+    config: { get: () => ({ ...DEFAULT_CONFIG }), load: async () => ({ ...DEFAULT_CONFIG }) }, logger: { warn() {} } })
   const skipped = await conflictRpc.call('write.continueOperation', {
     root: repo.root, kind: 'rebase', skip: true, confirm: true, reviewHash: conflictReview.hash,
   })
@@ -621,7 +621,7 @@ async function commitsSince(run, base) {
   const base = await run(['rev-parse', 'HEAD~2'])
   const shas = await commitsSince(run, base)
   const rpc = createRpc({ registry: new RepoRegistry({ gitPath }),
-    config: { get: () => ({ ...DEFAULT_CONFIG }) }, logger: { warn() {} } })
+    config: { get: () => ({ ...DEFAULT_CONFIG }), load: async () => ({ ...DEFAULT_CONFIG }) }, logger: { warn() {} } })
   const reply = await rpc.call('write.applyPlan', {
     root, confirm: true, base, commits: [{ sha: shas[0], action: 'edit' }, { sha: shas[1], action: 'reword' }],
     messages: { [shas[1]]: 'message after pause\n\nPreserved body.' },
@@ -727,7 +727,7 @@ async function commitsSince(run, base) {
   assert.equal(review.operation.kind, 'cherry-pick')
   assert(review.conflicts > 0)
   const registry = new RepoRegistry({ gitPath })
-  const rpc = createRpc({ registry, config: { get: () => ({ ...DEFAULT_CONFIG }) }, logger: { warn() {} } })
+  const rpc = createRpc({ registry, config: { get: () => ({ ...DEFAULT_CONFIG }), load: async () => ({ ...DEFAULT_CONFIG }) }, logger: { warn() {} } })
   const refused = await rpc.call('write.continueOperation', { root, kind: 'cherry-pick', skip: true, reviewHash: review.hash })
   assert.equal(refused.error?.code, 'git/needs-confirmation')
   const skipped = await rpc.call('write.continueOperation', { root, kind: 'cherry-pick', skip: true, reviewHash: review.hash, confirm: true })

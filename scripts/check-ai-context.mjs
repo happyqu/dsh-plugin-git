@@ -32,7 +32,7 @@ await writeFile(join(root, source), base.join('\n') + '\n')
 const registry = new RepoRegistry({ gitPath }), { session: repo } = await registry.open(root)
 let captured, config = { ...DEFAULT_CONFIG }
 let generateModel = async input => { captured = input; return 'fix: 示例提交' }
-const rpc = createRpc({ registry, config: { get: () => config }, llm: {
+const rpc = createRpc({ registry, config: { get: () => config, load: async () => config }, llm: {
   available: () => ({ available: true }), generateCommitMessage: input => generateModel(input),
 } })
 const generate = async payload => {
