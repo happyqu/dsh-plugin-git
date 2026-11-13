@@ -70,6 +70,14 @@ assert.equal(await remoteHead(), await run(['rev-parse', 'HEAD']))
 await run(['--git-dir=' + remote, 'update-ref', 'refs/heads/main', published], base)
 assert.equal((await rpc.call('write.push', { ...request, confirm: true })).ok, false)
 assert.equal(await remoteHead(), published)
+// A bare `--force` must stay UNREACHABLE, not merely discouraged: guessing the
+// flag name must not work. `force` is not a key the push handler reads, so this
+// request is an ORDINARY push of divergent history — refused by git itself —
+// and the remote is untouched. This is the assertion that keeps the lease the
+// only force form, and it is what a future "just add force too" change breaks.
+const bareForce = await rpc.call('write.push', { ...request, force: true, confirm: true })
+assert.equal(bareForce.ok, false, 'A bare --force must not be honoured')
+assert.equal(await remoteHead(), published)
 const replacement = await run(['rev-parse', 'HEAD'])
 assert.equal((await rpc.call('write.push', { root, remote: 'origin', sourceBranch: 'main', targetBranch: 'review/target' })).ok, true)
 assert.equal(await run(['--git-dir=' + remote, 'rev-parse', 'refs/heads/review/target'], base), replacement)

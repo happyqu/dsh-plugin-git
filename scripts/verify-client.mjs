@@ -2235,6 +2235,259 @@ for (const entry of ['quick action', 'context menu']) {
   }
 }
 
+console.log('\n--- force push is reachable, and only as --force-with-lease ---')
+{
+  // The plugin deliberately has NO bare `--force`: lib/git/write.js makes the
+  // dangerous form unreachable, and the lease refuses rather than overwriting a
+  // commit the user never saw. What was missing was any way to REACH the lease
+  // form outside the session header's sync menu — the full window, which is
+  // where branch work happens, had no entry at all.
+  //
+  // These assertions pin three things at once: the door exists, the payload is
+  // `forceWithLease` and not some other spelling, and the write never leaves
+  // without the confirmation token, which is the Host's proof that a human saw
+  // what was about to be overwritten.
+  const pushes = () => mounted.rpc.calls.filter((call) => call.method === 'write.push')
+  const rootProps = () => ({ connection: mounted.rpc, t })
+
+  let tree = await renderApp(healthyHandlers({ 'write.push': () => ({ ok: true, message: 'pushed' }) }))
+  const forceButton = () => findAll(tree, 'button').find((node) => node.props['data-force-push'] !== undefined)
+  check('the workbench title bar offers a force push', forceButton() !== undefined,
+    JSON.stringify(findAll(tree, 'button').map((node) => node.props['aria-label']).filter(Boolean)))
+  check('the force push is available for a tracked branch',
+    forceButton()?.props['data-force-push'] === 'available' && forceButton()?.props.disabled === false,
+    JSON.stringify({ state: forceButton()?.props['data-force-push'], disabled: forceButton()?.props.disabled }))
+
+  forceButton().props.onClick()
+  tree = await flush(GitApp, rootProps())
+  const confirm = () => walk(tree).find((node) => node.props?.role === 'alertdialog')
+  check('choosing it asks before anything is written', confirm() !== undefined && pushes().length === 0,
+    JSON.stringify({ dialog: confirm() !== undefined, pushes: pushes().length }))
+  check('the confirmation is the force-push warning, not a generic one',
+    hasText(confirm(), t('confirm.pushForceLease')), textOf(confirm()).slice(0, 200))
+  check('the confirmation is marked as destructive',
+    findAll(confirm(), 'button').some((node) => String(node.props.className).includes('dshgit-btn-danger') && textOf(node) === t('action.pushForceLease')))
+
+  findAll(confirm(), 'button').find((node) => textOf(node) === t('action.pushForceLease')).props.onClick()
+  await flush(GitApp, rootProps())
+  const sent = pushes().at(-1)
+  check('confirming sends a force-with-lease push of the current branch',
+    sent?.payload.forceWithLease === true && sent?.payload.confirm === true &&
+      sent?.payload.remote === 'origin' && sent?.payload.sourceBranch === 'main' && sent?.payload.targetBranch === 'main',
+    JSON.stringify(sent?.payload))
+  check('no bare force flag is ever sent', sent !== undefined && sent.payload.force === undefined,
+    JSON.stringify(Object.keys(sent?.payload ?? {})))
+
+  // A branch with no upstream has nothing to overwrite: the control exists but
+  // says why it cannot be used, which is better than a button that fails later.
+  tree = await renderApp(healthyHandlers({
+    status: () => ({ ...STATUS, branch: { ...STATUS.branch, upstream: null } }),
+    branchTracking: () => ({ ref: 'main', upstream: null, ahead: 0, behind: 0 }),
+  }))
+  const untracked = findAll(tree, 'button').find((node) => node.props['data-force-push'] !== undefined)
+  check('an untracked branch cannot force push', untracked?.props['data-force-push'] === 'unavailable' && untracked?.props.disabled === true,
+    JSON.stringify({ state: untracked?.props['data-force-push'], disabled: untracked?.props.disabled }))
+  check('the disabled control explains itself', untracked?.props.title === t('wb.pushForceNeedsUpstream'), String(untracked?.props.title))
+
+  // A remote name may itself contain a slash (`team/origin`), and the upstream
+  // short form is then ambiguous by prefix alone. The target must still resolve
+  // to the LONGEST matching remote name, or the plugin would force-push to
+  // `team` with a ref called `origin/review/feature` — a different branch on a
+  // different server.
+  tree = await renderApp(healthyHandlers({
+    status: () => ({ ...STATUS, branch: { ...STATUS.branch, upstream: 'team/origin/review/feature' } }),
+    branchTracking: () => ({ ref: 'main', upstream: 'team/origin/review/feature', ahead: 1, behind: 0 }),
+    remotes: () => [...REMOTES, { name: 'team' }, { name: 'team/origin' }],
+    'write.push': () => ({ ok: true, message: 'pushed' }),
+  }))
+  findAll(tree, 'button').find((node) => node.props['data-force-push'] !== undefined).props.onClick()
+  tree = await flush(GitApp, rootProps())
+  findAll(walk(tree).find((node) => node.props?.role === 'alertdialog') ?? {}, 'button')
+    .find((node) => textOf(node) === t('action.pushForceLease')).props.onClick()
+  await flush(GitApp, rootProps())
+  const slashPush = pushes().at(-1)
+  check('a remote name containing a slash resolves to the longest match',
+    slashPush?.payload.remote === 'team/origin' && slashPush?.payload.targetBranch === 'review/feature',
+    JSON.stringify(slashPush?.payload))
+
+  // The branch context menu is the other door, and it carries the same verb.
+  tree = await renderApp(healthyHandlers({ 'write.push': () => ({ ok: true, message: 'pushed' }) }))
+  tree = await selectModule(tree, 'graph')
+  // The context menu lives on the ROW (`dshgit-branch-item`), not on the select
+  // button inside it, so the row is found by its select button's ref.
+  const branchRow = walk(tree).find((node) => String(node.props?.className ?? '') === 'dshgit-branch-item' &&
+    findAll(node, 'button').some((button) => button.props['data-branch-ref'] === 'refs/heads/main'))
+  check('the workbench branch list has a right-clickable row', typeof branchRow?.props?.onContextMenu === 'function')
+  branchRow.props.onContextMenu({ clientX: 10, clientY: 20, preventDefault() {}, stopPropagation() {} })
+  tree = await flush(GitApp, rootProps())
+  const menu = walk(tree).find((node) => node.props?.className === 'dshgit-contextmenu')
+  const forceItem = findAll(menu ?? {}, 'button').find((node) => textOf(node).includes(t('wb.pushForce')))
+  check('the branch menu offers force push next to the ordinary push', forceItem !== undefined,
+    JSON.stringify(findAll(menu ?? {}, 'button').map((node) => textOf(node)).slice(0, 16)))
+  check('the force entry names the command it runs', hasText(forceItem, '--force-with-lease'), textOf(forceItem))
+  forceItem.props.onClick()
+  tree = await flush(GitApp, rootProps())
+  check('the menu entry asks before writing too', walk(tree).some((node) => node.props?.role === 'alertdialog') && pushes().length === 0)
+  findAll(walk(tree).find((node) => node.props?.role === 'alertdialog') ?? {}, 'button')
+    .find((node) => textOf(node) === t('action.pushForceLease')).props.onClick()
+  await flush(GitApp, rootProps())
+  const menuPush = pushes().at(-1)
+  check('the menu entry sends a force-with-lease push once confirmed',
+    menuPush?.payload.forceWithLease === true && menuPush?.payload.confirm === true &&
+      menuPush?.payload.sourceBranch === 'main' && menuPush?.payload.targetBranch === 'main',
+    JSON.stringify(menuPush?.payload))
+}
+
+console.log('\n--- a refused lease is explained, not just reported ---')
+{
+  // `--force-with-lease` refusing is the LEASE working: git prints
+  // `! [rejected] … (stale info)`. Reported as an opaque error that reads like
+  // a broken push, and the old classifier would have matched the
+  // "non-fast-forward / updates were rejected" family and offered "Pull" —
+  // advice that silently changes the shape of history the user asked to force.
+  // The banner must say the lease did its job and offer Fetch, which is the
+  // read that shows what would be overwritten.
+  const raw = [
+    'To https://github.com/user/repo.git',
+    ' ! [rejected]        main -> main (stale info)',
+    "error: failed to push some refs to 'https://github.com/user/repo.git'",
+  ].join('\n')
+  let tree = await renderChips(healthyHandlers({
+    status: () => ({ ...STATUS, branch: { ...STATUS.branch, ahead: 1, behind: 1 } }),
+    branchTracking: () => ({ ref: 'main', upstream: 'origin/main', ahead: 1, behind: 1 }),
+    'write.push': () => { const error = new Error(raw); error.code = 'git/write-failed'; throw error },
+  }))
+  findAll(tree, 'button').find((node) => node.props['data-chip'] === 'sync-menu')
+    .props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 900, bottom: 40 }) } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(tree, 'button').find((node) => node.props['data-sync'] === 'push-lease').props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  // The sync menu's force entry asks first, exactly like the other doors.
+  check('the sync menu asks before forcing', walk(tree).some((node) => node.props?.role === 'alertdialog') &&
+    !mounted.rpc.calls.some((call) => call.method === 'write.push'))
+  findAll(walk(tree).find((node) => node.props?.role === 'alertdialog') ?? {}, 'button')
+    .find((node) => textOf(node) === t('action.pushForceLease')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const banner = walk(tree).find((node) => String(node.props?.className ?? '').includes('dshgit-notice'))
+  const summary = walk(banner).find((node) => String(node.props?.className ?? '').includes('dshgit-noticetext'))
+  check('a stale lease is explained as the lease refusing', textOf(summary) === t('failure.staleLease'), textOf(summary))
+  check('the explanation does not repeat git\'s rejection line',
+    !textOf(summary).includes('stale info') && !textOf(summary).includes('failed to push some refs'), textOf(summary))
+  const fetchFix = findAll(banner, 'button').find((node) => textOf(node) === t('failure.actionFetch'))
+  check('the fix offered is Fetch, not Pull', fetchFix !== undefined &&
+    !findAll(banner, 'button').some((node) => textOf(node) === t('failure.actionPull')),
+    JSON.stringify(findAll(banner, 'button').map(textOf)))
+  fetchFix.props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('the offered fix actually fetches',
+    mounted.rpc.calls.some((call) => call.method === 'write.fetch' && call.payload.prune === true))
+}
+
+console.log('\n--- a disabled force entry says why, in the row itself ---')
+{
+  // A disabled button shows no tooltip in most browsers, so this row's `title`
+  // alone would be invisible exactly when the user needs it. The reason is
+  // therefore RENDERED inside the row, and the row is visibly dimmed — a row
+  // that looks enabled and does nothing reads as a broken button.
+  let tree = await renderChips(healthyHandlers({
+    status: () => ({ ...STATUS, branch: { ...STATUS.branch, upstream: null } }),
+    branchTracking: () => ({ ref: 'main', upstream: null, ahead: 0, behind: 0 }),
+  }))
+  findAll(tree, 'button').find((node) => node.props['data-chip'] === 'sync-menu')
+    .props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 900, bottom: 40 }) } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const entry = findAll(tree, 'button').find((node) => node.props['data-sync'] === 'push-lease')
+  check('the force entry is disabled without an upstream', entry?.props.disabled === true)
+  check('the disabled entry explains itself in the row, not only in a tooltip',
+    hasText(entry, t('wb.pushForceNeedsUpstream')), textOf(entry))
+  check('the row is visibly dimmed while disabled',
+    String(entry?.props.className ?? '').includes('dshgit-pickdanger') &&
+      String(loaded.appendedStyles[0]?.textContent ?? '').includes('.dshgit-popover[data-popover="sync"] .dshgit-pickdanger:disabled{'),
+    String(entry?.props.className))
+
+  // A tracked branch has no reason to explain itself, so the hint must go away.
+  tree = await renderChips(healthyHandlers())
+  findAll(tree, 'button').find((node) => node.props['data-chip'] === 'sync-menu')
+    .props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 900, bottom: 40 }) } })
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const enabled = findAll(tree, 'button').find((node) => node.props['data-sync'] === 'push-lease')
+  check('a tracked branch can force push from the same entry', enabled?.props.disabled === false)
+  check('the unavailable hint is gone once it is available',
+    !hasText(enabled, t('wb.pushForceNeedsUpstream')), textOf(enabled))
+}
+
+console.log('\n--- the workbench error banner uses the same classifier ---')
+{
+  // The full window and the session header report failures through two separate
+  // components: the header has always run the classifier, while the workbench
+  // used to drop the raw message into its banner. That meant the SAME refused
+  // push read as an explanation in one surface and as terminal output in the
+  // other, and no "fix" button existed in the window at all.
+  //
+  // The workbench banner also differs by DESIGN: it offers only the actions this
+  // surface implements. `pull` needs the merge-or-rebase question and `publish`
+  // needs the remote dialog, so wiring them to something approximate would be
+  // worse than not offering them — but that decision has to be asserted, or a
+  // later "just pass the action through" change would silently add buttons that
+  // do the wrong thing.
+  const raw = [
+    'To https://github.com/user/repo.git',
+    ' ! [rejected]        main -> main (stale info)',
+    "error: failed to push some refs to 'https://github.com/user/repo.git'",
+  ].join('\n')
+  let tree = await renderApp(healthyHandlers({
+    'write.push': () => { const error = new Error(raw); error.code = 'git/write-failed'; throw error },
+  }))
+  findAll(tree, 'button').find((node) => node.props['data-force-push'] !== undefined).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(walk(tree).find((node) => node.props?.role === 'alertdialog') ?? {}, 'button')
+    .find((node) => textOf(node) === t('action.pushForceLease')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+
+  const banner = walk(tree).find((node) => String(node.props?.className ?? '') === 'dshgit-notice')
+  const summary = walk(banner).find((node) => String(node.props?.className ?? '').includes('dshgit-noticetext'))
+  check('the workbench banner explains the failure instead of quoting git', textOf(summary) === t('failure.staleLease'), textOf(summary))
+  const fix = findAll(banner, 'button').find((node) => textOf(node) === t('failure.actionFetch'))
+  check('the workbench banner offers the fix', fix !== undefined, JSON.stringify(findAll(banner, 'button').map(textOf)))
+  fix.props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  check('the workbench fix runs from the window, not the settings tab',
+    mounted.rpc.calls.some((call) => call.method === 'write.fetch' && call.payload.prune === true))
+
+  // An auth failure keeps its own action, which is the one case where Settings
+  // IS the answer.
+  tree = await renderApp(healthyHandlers({
+    'write.push': () => { const error = new Error('fatal: Authentication failed'); error.code = 'git/write-failed'; throw error },
+  }))
+  findAll(tree, 'button').find((node) => node.props['data-force-push'] !== undefined).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(walk(tree).find((node) => node.props?.role === 'alertdialog') ?? {}, 'button')
+    .find((node) => textOf(node) === t('action.pushForceLease')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const authBanner = walk(tree).find((node) => String(node.props?.className ?? '') === 'dshgit-notice')
+  check('an auth failure still points at the settings that fix it',
+    findAll(authBanner, 'button').some((node) => textOf(node) === t('auth.help')),
+    JSON.stringify(findAll(authBanner, 'button').map(textOf)))
+  check('an auth failure is not described as a lease problem',
+    textOf(walk(authBanner).find((node) => String(node.props?.className ?? '').includes('dshgit-noticetext'))) !== t('failure.staleLease'))
+
+  // A `pull`-class failure must NOT grow a button here: the classifier names one,
+  // and this surface has no flow for it.
+  tree = await renderApp(healthyHandlers({
+    'write.push': () => { const error = new Error("! [rejected] main -> main (non-fast-forward)\nerror: failed to push some refs"); error.code = 'git/write-failed'; throw error },
+  }))
+  findAll(tree, 'button').find((node) => node.props['data-force-push'] !== undefined).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  findAll(walk(tree).find((node) => node.props?.role === 'alertdialog') ?? {}, 'button')
+    .find((node) => textOf(node) === t('action.pushForceLease')).props.onClick()
+  tree = await flush(GitApp, { connection: mounted.rpc, t })
+  const divergenceBanner = walk(tree).find((node) => String(node.props?.className ?? '') === 'dshgit-notice')
+  check('the workbench does not offer a pull it cannot run', !findAll(divergenceBanner, 'button').some((node) => textOf(node) === t('failure.actionPull')),
+    JSON.stringify(findAll(divergenceBanner, 'button').map(textOf)))
+  check('the failure is still explained in plain language',
+    textOf(walk(divergenceBanner).find((node) => String(node.props?.className ?? '').includes('dshgit-noticetext'))) === t('failure.nonFastForward'))
+}
+
 console.log('\n--- header local checkout confirmation ---')
 for (const entry of ['row', 'quick action', 'context menu']) {
   let header = await renderChips()
