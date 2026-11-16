@@ -955,6 +955,30 @@ console.log('PASS C-quoted diff headers decode to real paths, renames included')
   const { tmpdir } = await import('node:os')
   const { join } = await import('node:path')
   const { RepoRegistry } = await import('../lib/git/repo.js')
+  const { classifyRepoProbeFailure } = await import('../lib/git/capability.js')
+
+  // The classification is asserted on BOTH spellings of the same situation,
+  // because the wording moved in Git 2.56 (setup.c). A runner with a newer Git
+  // than the one used locally reported a moved checkout as "not a repository".
+  assert.equal(
+    classifyRepoProbeFailure('fatal: not a git repository: /gone/.git'),
+    'broken-git-link',
+    'Git <= 2.55 names the missing gitdir target',
+  )
+  assert.equal(
+    classifyRepoProbeFailure('fatal: gitfile does not point to a valid repository: /gone/.git'),
+    'broken-git-link',
+    'Git >= 2.56 reworded the same failure; it must stay a broken link',
+  )
+  assert.equal(
+    classifyRepoProbeFailure('fatal: not a git repository (or any of the parent directories): .git'),
+    'not-a-repository',
+    'the empty-folder form carries no path and must not be read as a broken link',
+  )
+  assert.equal(
+    classifyRepoProbeFailure('fatal: this operation must be run in a work tree'),
+    'bare-repository',
+  )
 
   const base = await mkdtemp(join(tmpdir(), 'dshgit-open-'))
   const registry = new RepoRegistry({ resolveGitPath: async () => 'git' })
